@@ -2,8 +2,6 @@ import datetime
 import logging
 import sqlite3
 import pytz
-import matplotlib.pyplot as plt
-import io
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
@@ -17,35 +15,49 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
     CallbackQueryHandler,
-    filters
+    filters,
+    JobQueue
 )
 
 # --- Database Setup --- #
 def get_db_connection():
     conn = sqlite3.connect('budget.db', check_same_thread=False)
-    conn.row_factory = sqlite3.Row  # Allows dictionary-style access
+    conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
     with get_db_connection() as conn:
         conn.execute('''CREATE TABLE IF NOT EXISTS transactions
                      (id INTEGER PRIMARY KEY, user_id INTEGER, type TEXT, amount REAL,
-                     description TEXT, date TEXT, category TEXT)''')
+                     description TEXT, date TEXT, currency TEXT)''')
         conn.execute('''CREATE TABLE IF NOT EXISTS holds
-                     (id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL, description TEXT)''')
-        conn.execute('''CREATE TABLE IF NOT EXISTS categories
-                     (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, type TEXT)''')
+                     (id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL, description TEXT, currency TEXT)''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS recurring
+                     (id INTEGER PRIMARY KEY, user_id INTEGER, type TEXT, amount REAL,
+                     description TEXT, currency TEXT, day_of_month INTEGER,
+                     is_active INTEGER DEFAULT 1)''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS user_settings
+                     (user_id INTEGER PRIMARY KEY, default_currency TEXT)''')
 
 # --- Constants --- #
-MAIN_MENU, ADD_INCOME, ADD_OUTCOME, ADD_HOLD, MANAGE_HOLDS, SET_CATEGORY = range(6)
-TIMEZONE = pytz.timezone('Europe/Moscow')  # Change to your timezone
-DEFAULT_CATEGORIES = {
-    'income': ['Salary', 'Freelance', 'Investments', 'Gifts'],
-    'outcome': ['Food', 'Transport', 'Utilities', 'Entertainment', 'Shopping']
+MAIN_MENU, ADD_INCOME, ADD_OUTCOME, ADD_HOLD, MANAGE_HOLDS, \
+RECURRING_MENU, ADD_RECURRING, CURRENCY_MENU = range(8)
+TIMEZONE = pytz.timezone('Europe/Moscow')
+CURRENCIES = {
+    'USD': '$',
+    'EUR': '€',
+    'CHF': 'Fr',
+    'GBP': '£',
+    'JPY': '¥',
+    'RUB': '₽'
 }
 
 # Keyboard layouts
-main_keyboard = [['💰 Balance', '📥 Income'], ['📤 Outcome', '⏳ Holds'], ['📊 Statistics', '🗂 Categories']]
+main_keyboard = [
+    ['💰 Balance', '📥 Income'], 
+    ['📤 Outcome', '⏳ Holds'],
+    ['🔄 Recurring', '💱 Currency']
+]
 cancel_keyboard = [['❌ Cancel']]
 
 # --- Logging Setup --- #
@@ -56,69 +68,44 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Helper Functions --- #
-def format_money(amount):
-    return f"${abs(amount):.2f}"
+def get_user_currency(user_id):
+    with get_db_connection() as conn:
+        currency = conn.execute("SELECT default_currency FROM user_settings WHERE user_id = ?", 
+                              (user_id,)).fetchone()
+        return currency['default_currency'] if currency else 'USD'
+
+def format_money(amount, currency='USD'):
+    symbol = CURRENCIES.get(currency, '$')
+    return f"{symbol}{abs(amount):.2f}"
 
 def get_current_datetime():
     return datetime.datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
 
-def generate_balance_chart(income, outcome, holds):
-    # Create pie chart for balance breakdown
-    labels = ['Income', 'Expenses', 'Holds']
-    sizes = [income, -outcome, holds]
-    colors = ['#4CAF50', '#F44336', '#FFC107']
-    
-    fig, ax = plt.subplots()
-    ax.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
-    ax.axis('equal')  # Equal aspect ratio ensures the pie chart is circular
-    ax.set_title('Balance Breakdown')
-    
-    # Save plot to bytes
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png')
-    buf.seek(0)
-    plt.close()
-    return buf
-
-def generate_category_chart(transactions, title):
-    if not transactions:
-        return None
-    
-    categories = [t['category'] if t['category'] else 'Uncategorized' for t in transactions]
-    amounts = [abs(t['amount']) for t in transactions]
-    
-    # Group by category
-    data = {}
-    for cat, amt in zip(categories, amounts):
-        data[cat] = data.get(cat, 0) + amt
-    
-    labels = list(data.keys())
-    sizes = list(data.values())
-    
-    fig, ax = plt.subplots()
-    ax.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90)
-    ax.axis('equal')
-    ax.set_title(title)
-    
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png')
-    buf.seek(0)
-    plt.close()
-    return buf
+async def process_recurring_transactions(context: ContextTypes.DEFAULT_TYPE):
+    today = datetime.datetime.now(TIMEZONE).day
+    with get_db_connection() as conn:
+        recurring = conn.execute("SELECT * FROM recurring WHERE day_of_month = ? AND is_active = 1", 
+                               (today,)).fetchall()
+        
+        for transaction in recurring:
+            conn.execute(
+                "INSERT INTO transactions (user_id, type, amount, description, date, currency) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (transaction['user_id'], transaction['type'], transaction['amount'], 
+                 transaction['description'], get_current_datetime(), transaction['currency'])
+            )
+            logger.info(f"Processed recurring transaction for user {transaction['user_id']}")
 
 # --- Handlers --- #
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.message.from_user
     
-    # Initialize default categories for new users
     with get_db_connection() as conn:
-        existing_cats = conn.execute("SELECT COUNT(*) FROM categories WHERE user_id = ?", 
-                                   (user.id,)).fetchone()[0]
-        if existing_cats == 0:
-            for cat_type, categories in DEFAULT_CATEGORIES.items():
-                for cat_name in categories:
-                    conn.execute("INSERT INTO categories (user_id, name, type) VALUES (?, ?, ?)",
-                               (user.id, cat_name, cat_type))
+        user_exists = conn.execute("SELECT 1 FROM user_settings WHERE user_id = ?", 
+                                 (user.id,)).fetchone()
+        if not user_exists:
+            conn.execute("INSERT INTO user_settings (user_id, default_currency) VALUES (?, ?)",
+                       (user.id, 'USD'))
     
     await update.message.reply_text(
         f"Welcome to Budget Planner, {user.first_name}!\n"
@@ -129,6 +116,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
+    currency = get_user_currency(user_id)
     
     with get_db_connection() as conn:
         income = conn.execute("SELECT SUM(amount) FROM transactions WHERE user_id = ? AND type = 'income'", 
@@ -138,131 +126,254 @@ async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         holds = conn.execute("SELECT SUM(amount) FROM holds WHERE user_id = ?", 
                            (user_id,)).fetchone()[0] or 0
 
-    balance = income + outcome  # Outcome is stored as negative
+    balance = income + outcome
     total_expenses = -outcome if outcome < 0 else outcome
 
-    # Generate balance chart
-    chart = generate_balance_chart(income, outcome, holds)
-    
-    # Send message with chart
-    await update.message.reply_photo(
-        photo=chart,
-        caption=f"💰 Current Balance: {format_money(balance)}\n"
-                f"📥 Total Income: {format_money(income)}\n"
-                f"📤 Total Expenses: {format_money(total_expenses)}\n"
-                f"⏳ Held Amount: {format_money(holds)}",
+    await update.message.reply_text(
+        f"💰 Current Balance: {format_money(balance, currency)}\n"
+        f"📥 Total Income: {format_money(income, currency)}\n"
+        f"📤 Total Expenses: {format_money(total_expenses, currency)}\n"
+        f"⏳ Held Amount: {format_money(holds, currency)}",
         reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
     return MAIN_MENU
 
-async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.message.from_user.id
+async def currency_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    keyboard = [
+        [InlineKeyboardButton(f"{code} {symbol}", callback_data=f"currency_{code}") 
+         for code, symbol in list(CURRENCIES.items())[i:i+2]]
+        for i in range(0, len(CURRENCIES), 2)
+    ]
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_currency")])
+    
+    await update.message.reply_text(
+        "Select your default currency:",
+        reply_markup=InlineKeyboardMarkup(keyboard))
+    return CURRENCY_MENU
+
+async def set_currency(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    currency_code = query.data.split('_')[1]
+    user_id = query.from_user.id
     
     with get_db_connection() as conn:
-        # Get last 30 days transactions
-        last_month = (datetime.datetime.now(TIMEZONE) - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
-        income_trans = conn.execute("SELECT * FROM transactions WHERE user_id = ? AND type = 'income' AND date >= ?",
-                                  (user_id, last_month)).fetchall()
-        outcome_trans = conn.execute("SELECT * FROM transactions WHERE user_id = ? AND type = 'outcome' AND date >= ?",
-                                    (user_id, last_month)).fetchall()
+        conn.execute("INSERT OR REPLACE INTO user_settings (user_id, default_currency) VALUES (?, ?)",
+                   (user_id, currency_code))
     
-    # Generate charts
-    income_chart = generate_category_chart(income_trans, "Income by Category (Last 30 Days)")
-    outcome_chart = generate_category_chart(outcome_trans, "Expenses by Category (Last 30 Days)")
-    
-    if income_chart:
-        await update.message.reply_photo(
-            photo=income_chart,
-            caption="Income Statistics",
-            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
-    
-    if outcome_chart:
-        await update.message.reply_photo(
-            photo=outcome_chart,
-            caption="Expense Statistics",
-            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
-    
-    if not income_chart and not outcome_chart:
-        await update.message.reply_text(
-            "No transaction data available for the last 30 days.",
-            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
-    
-    return MAIN_MENU
+    await query.edit_message_text(
+        f"✅ Default currency set to {currency_code} {CURRENCIES.get(currency_code, '')}")
+    return await start_over(update, context)
 
-async def category_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def recurring_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     keyboard = [
-        ["📥 Income Categories", "📤 Expense Categories"],
-        ["➕ Add Category", "🔙 Back"]
+        ["➕ Add Recurring", "📋 List Recurring"],
+        ["🔙 Back"]
     ]
     await update.message.reply_text(
-        "Manage your transaction categories:",
+        "Manage recurring transactions:",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
-    return MAIN_MENU
+    return RECURRING_MENU
 
-async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.message.from_user.id
-    category_type = "income" if "Income" in update.message.text else "outcome"
-    
-    with get_db_connection() as conn:
-        categories = conn.execute("SELECT name FROM categories WHERE user_id = ? AND type = ?",
-                                (user_id, category_type)).fetchall()
-    
-    if not categories:
-        await update.message.reply_text(
-            f"No {category_type} categories found!",
-            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
-        return MAIN_MENU
-    
-    category_list = "\n".join([f"• {cat['name']}" for cat in categories])
-    await update.message.reply_text(
-        f"{category_type.capitalize()} Categories:\n{category_list}",
-        reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
-    return MAIN_MENU
-
-async def add_category_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def add_recurring_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     keyboard = [["Income", "Outcome"], ["❌ Cancel"]]
     await update.message.reply_text(
-        "Select category type:",
+        "Select type of recurring transaction:",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
-    return SET_CATEGORY
+    return ADD_RECURRING
 
-async def set_category_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data['category_type'] = update.message.text.lower()
+async def add_recurring_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # Store the type in user_data before asking for details
+    context.user_data['recurring_type'] = update.message.text.lower()
     await update.message.reply_text(
-        "Enter the name of the new category:",
-        reply_markup=ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True))
-    return SET_CATEGORY
+        "Enter details in format:\n"
+        "<b>Amount DayOfMonth Description</b>\n"
+        "Example: 1000 5 Salary\n"
+        "DayOfMonth should be between 1-28",
+        reply_markup=ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True),
+        parse_mode="HTML")
+    return ADD_RECURRING
 
-async def add_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def add_recurring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
-    category_name = update.message.text
-    category_type = context.user_data.get('category_type', 'outcome')
+    text = update.message.text.split()
+    currency = get_user_currency(user_id)
+
+    try:
+        # Check if recurring_type exists in context
+        if 'recurring_type' not in context.user_data:
+            await update.message.reply_text(
+                "Please start over and select the transaction type first",
+                reply_markup=ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True))
+            return ADD_RECURRING
+
+        amount = float(text[0])
+        day = int(text[1])
+        description = ' '.join(text[2:]) if len(text) > 2 else "Recurring"
+        
+        if not 1 <= day <= 28:
+            raise ValueError("Day must be between 1-28")
+
+        with get_db_connection() as conn:
+            conn.execute(
+                "INSERT INTO recurring (user_id, type, amount, description, day_of_month, currency) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, context.user_data['recurring_type'], amount, description, day, currency)
+            )
+
+        # Clear the recurring_type from user_data after successful addition
+        context.user_data.pop('recurring_type', None)
+
+        await update.message.reply_text(
+            f"✅ Added recurring {context.user_data.get('recurring_type', 'transaction')}: "
+            f"{format_money(amount, currency)} on day {day} for {description}",
+            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+        return MAIN_MENU
+
+    except (ValueError, IndexError) as e:
+        await update.message.reply_text(
+            f"❌ Invalid format: {str(e)}\n"
+            "Please enter: Amount DayOfMonth Description\n"
+            "Example: 1000 5 Salary",
+            reply_markup=ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True))
+        return ADD_RECURRING
+
+async def list_recurring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.message.from_user.id
     
     with get_db_connection() as conn:
-        conn.execute("INSERT INTO categories (user_id, name, type) VALUES (?, ?, ?)",
-                   (user_id, category_name, category_type))
-    
+        recurring = conn.execute("SELECT * FROM recurring WHERE user_id = ?", 
+                              (user_id,)).fetchall()
+
+    if not recurring:
+        await update.message.reply_text(
+            "No recurring transactions found!",
+            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+        return MAIN_MENU
+
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{idx}. {trans['type'].capitalize()}: {format_money(trans['amount'], trans['currency'])} "
+            f"on day {trans['day_of_month']} - {trans['description']}",
+            callback_data=f"recur_{trans['id']}"
+        )]
+        for idx, trans in enumerate(recurring, 1)
+    ]
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_recurring")])
+
     await update.message.reply_text(
-        f"✅ Added new {category_type} category: {category_name}",
-        reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
-    return MAIN_MENU
+        "📋 Your recurring transactions:\nSelect one to manage:",
+        reply_markup=InlineKeyboardMarkup(keyboard))
+    return RECURRING_MENU
+
+async def manage_recurring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    recurring_id = query.data.split('_')[1]
+    context.user_data['current_recurring'] = recurring_id
+
+    with get_db_connection() as conn:
+        recurring = conn.execute("SELECT * FROM recurring WHERE id = ?", 
+                              (recurring_id,)).fetchone()
+
+    await query.edit_message_text(
+        text=f"Recurring transaction selected:\n"
+             f"Type: {recurring['type'].capitalize()}\n"
+             f"Amount: {format_money(recurring['amount'], recurring['currency'])}\n"
+             f"Day: {recurring['day_of_month']}\n"
+             f"Description: {recurring['description']}\n\n"
+             "Choose action:",
+        reply_markup=InlineKeyboardMarkup([
+            #[InlineKeyboardButton("✏️ Edit", callback_data=f"edit_recur_{recurring_id}"),
+            [InlineKeyboardButton("❌ Remove", callback_data=f"remove_recur_{recurring_id}")],
+            [InlineKeyboardButton("🔙 Back", callback_data="back_recur_list")]
+        ]))
+    return RECURRING_MENU
+
+async def remove_recurring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    recurring_id = query.data.split('_')[2]
+
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM recurring WHERE id = ?", (recurring_id,))
+
+    await query.edit_message_text("✅ Recurring transaction removed successfully!")
+    return await start_over(update, context)
+
+async def edit_recurring_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    recurring_id = query.data.split('_')[2]
+    context.user_data['editing_recurring'] = recurring_id
+
+    # Use inline keyboard instead of reply keyboard
+    await query.edit_message_text(
+        "Enter new details in format:\n"
+        "<b>Amount DayOfMonth Description</b>\n"
+        "Example: 1000 5 Salary\n"
+        "DayOfMonth should be between 1-28",
+        parse_mode="HTML"
+    )
+    return ADD_RECURRING
+
+async def edit_recurring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.message.from_user.id
+    text = update.message.text.split()
+
+    try:
+        amount = float(text[0])
+        day = int(text[1])
+        description = ' '.join(text[2:]) if len(text) > 2 else "Recurring"
+        
+        if not 1 <= day <= 28:
+            raise ValueError("Day must be between 1-28")
+
+        with get_db_connection() as conn:
+            # Get existing recurring to preserve type and currency
+            recurring = conn.execute("SELECT * FROM recurring WHERE id = ?",
+                                   (context.user_data['editing_recurring'],)).fetchone()
+            
+            conn.execute(
+                "UPDATE recurring SET amount = ?, day_of_month = ?, description = ? WHERE id = ?",
+                (amount, day, description, context.user_data['editing_recurring'])
+            )
+
+        # Clean up
+        context.user_data.pop('editing_recurring', None)
+
+        # Use inline keyboard for consistency
+        keyboard = [
+            [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="back_main")]
+        ]
+        
+        await update.message.reply_text(
+            f"✅ Updated recurring transaction:\n"
+            f"Amount: {format_money(amount, recurring['currency'])}\n"
+            f"Day: {day}\n"
+            f"Description: {description}",
+            reply_markup=InlineKeyboardMarkup(keyboard))
+        return MAIN_MENU
+
+    except (ValueError, IndexError) as e:
+        keyboard = [
+            [InlineKeyboardButton("❌ Cancel", callback_data="back_recur_list")]
+        ]
+        await update.message.reply_text(
+            f"❌ Invalid format: {str(e)}\n"
+            "Please enter: Amount DayOfMonth Description\n"
+            "Example: 1000 5 Salary",
+            reply_markup=InlineKeyboardMarkup(keyboard))
+        return ADD_RECURRING
 
 async def income_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
-    
-    with get_db_connection() as conn:
-        categories = conn.execute("SELECT name FROM categories WHERE user_id = ? AND type = 'income'",
-                                (user_id,)).fetchall()
-    
-    category_list = "\n".join([f"• {cat['name']}" for cat in categories]) if categories else "No categories set"
+    currency = get_user_currency(user_id)
     
     await update.message.reply_text(
-        "➕ Add income in format:\n"
+        f"➕ Add income in format (currency: {currency}):\n"
         "<b>Amount</b> (e.g., 1000)\n"
         "OR\n"
-        "<b>Amount Description</b> (e.g., 1000 Salary)\n"
-        "OR\n"
-        "<b>Amount Category</b> (e.g., 1000 Freelance)\n\n"
-        f"Available categories:\n{category_list}",
+        "<b>Amount Description</b> (e.g., 1000 Salary)",
         reply_markup=ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True),
         parse_mode="HTML")
     return ADD_INCOME
@@ -270,56 +381,39 @@ async def income_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 async def add_income(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
     text = update.message.text.split()
+    currency = get_user_currency(user_id)
 
     try:
         amount = float(text[0])
         description = ' '.join(text[1:]) if len(text) > 1 else "Income"
-        category = None
-        
-        # Check if the description matches a category
-        with get_db_connection() as conn:
-            categories = conn.execute("SELECT name FROM categories WHERE user_id = ? AND type = 'income'",
-                                    (user_id,)).fetchall()
-            categories = [cat['name'].lower() for cat in categories]
-            
-            if description.lower() in categories:
-                category = description
-                description = f"Income ({category})"
 
         with get_db_connection() as conn:
             conn.execute(
-                "INSERT INTO transactions (user_id, type, amount, description, date, category) VALUES (?, ?, ?, ?, ?, ?)",
-                (user_id, 'income', amount, description, get_current_datetime(), category)
+                "INSERT INTO transactions (user_id, type, amount, description, date, currency) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, 'income', amount, description, get_current_datetime(), currency)
             )
 
         await update.message.reply_text(
-            f"✅ Added income: {format_money(amount)} for {description}",
+            f"✅ Added income: {format_money(amount, currency)} for {description}",
             reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
         return MAIN_MENU
 
     except (ValueError, IndexError):
         await update.message.reply_text(
-            "❌ Invalid format. Please enter amount and optional description/category",
+            "❌ Invalid format. Please enter amount and optional description",
             reply_markup=ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True))
         return ADD_INCOME
 
 async def outcome_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
-    
-    with get_db_connection() as conn:
-        categories = conn.execute("SELECT name FROM categories WHERE user_id = ? AND type = 'outcome'",
-                                (user_id,)).fetchall()
-    
-    category_list = "\n".join([f"• {cat['name']}" for cat in categories]) if categories else "No categories set"
+    currency = get_user_currency(user_id)
     
     await update.message.reply_text(
-        "➖ Add expense in format:\n"
+        f"➖ Add expense in format (currency: {currency}):\n"
         "<b>Amount</b> (e.g., 50)\n"
         "OR\n"
-        "<b>Amount Description</b> (e.g., 50 Groceries)\n"
-        "OR\n"
-        "<b>Amount Category</b> (e.g., 50 Food)\n\n"
-        f"Available categories:\n{category_list}",
+        "<b>Amount Description</b> (e.g., 50 Groceries)",
         reply_markup=ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True),
         parse_mode="HTML")
     return ADD_OUTCOME
@@ -327,57 +421,47 @@ async def outcome_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 async def add_outcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
     text = update.message.text.split()
+    currency = get_user_currency(user_id)
 
     try:
         amount = float(text[0]) * -1  # Store as negative
         description = ' '.join(text[1:]) if len(text) > 1 else "Expense"
-        category = None
-        
-        # Check if the description matches a category
-        with get_db_connection() as conn:
-            categories = conn.execute("SELECT name FROM categories WHERE user_id = ? AND type = 'outcome'",
-                                    (user_id,)).fetchall()
-            categories = [cat['name'].lower() for cat in categories]
-            
-            if description.lower() in categories:
-                category = description
-                description = f"Expense ({category})"
 
         with get_db_connection() as conn:
             conn.execute(
-                "INSERT INTO transactions (user_id, type, amount, description, date, category) VALUES (?, ?, ?, ?, ?, ?)",
-                (user_id, 'outcome', amount, description, get_current_datetime(), category)
+                "INSERT INTO transactions (user_id, type, amount, description, date, currency) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, 'outcome', amount, description, get_current_datetime(), currency)
             )
 
         await update.message.reply_text(
-            f"✅ Added expense: {format_money(-amount)} for {description}",
+            f"✅ Added expense: {format_money(-amount, currency)} for {description}",
             reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
         return MAIN_MENU
 
     except (ValueError, IndexError):
         await update.message.reply_text(
-            "❌ Invalid format. Please enter amount and optional description/category",
+            "❌ Invalid format. Please enter amount and optional description",
             reply_markup=ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True))
         return ADD_OUTCOME
 
-# --- Hold Functions --- #
 async def holds_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
+    currency = get_user_currency(user_id)
     
     with get_db_connection() as conn:
         holds = conn.execute("SELECT * FROM holds WHERE user_id = ?", (user_id,)).fetchall()
 
     if not holds:
         await update.message.reply_text(
-            "No holds found! Add a new hold:",
+            f"No holds found! Add a new hold (currency: {currency}):",
             reply_markup=ReplyKeyboardMarkup([['➕ Add Hold'], ['🔙 Back']], resize_keyboard=True))
         return MAIN_MENU
 
     holds_list = "\n".join(
-        f"{idx+1}. {format_money(hold['amount'])} - {hold['description']}" 
+        f"{idx+1}. {format_money(hold['amount'], hold.get('currency', currency))} - {hold['description']}" 
         for idx, hold in enumerate(holds)
     )
-    context.user_data['holds'] = holds
 
     await update.message.reply_text(
         f"⏳ Your holds:\n{holds_list}\n\nSelect an action:",
@@ -389,8 +473,10 @@ async def holds_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return MAIN_MENU
 
 async def add_hold_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.message.from_user.id
+    currency = get_user_currency(user_id)
     await update.message.reply_text(
-        "⏳ Add hold in format:\n"
+        f"⏳ Add hold in format (currency: {currency}):\n"
         "<b>Amount</b> (e.g., 1000)\n"
         "OR\n"
         "<b>Amount Description</b> (e.g., 1000 Amazon)",
@@ -401,6 +487,7 @@ async def add_hold_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def add_hold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
     text = update.message.text.split()
+    currency = get_user_currency(user_id)
 
     try:
         amount = float(text[0])
@@ -408,12 +495,12 @@ async def add_hold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
         with get_db_connection() as conn:
             conn.execute(
-                "INSERT INTO holds (user_id, amount, description) VALUES (?, ?, ?)",
-                (user_id, amount, description)
+                "INSERT INTO holds (user_id, amount, description, currency) VALUES (?, ?, ?, ?)",
+                (user_id, amount, description, currency)
             )
 
         await update.message.reply_text(
-            f"⏳ Added hold: {format_money(amount)} for {description}",
+            f"⏳ Added hold: {format_money(amount, currency)} for {description}",
             reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
         return MAIN_MENU
 
@@ -422,6 +509,33 @@ async def add_hold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             "❌ Invalid format. Please enter amount and optional description",
             reply_markup=ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True))
         return ADD_HOLD
+
+async def holds_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.message.from_user.id
+    currency = get_user_currency(user_id)
+    
+    with get_db_connection() as conn:
+        holds = conn.execute("SELECT * FROM holds WHERE user_id = ?", (user_id,)).fetchall()
+
+    if not holds:
+        await update.message.reply_text(
+            f"No holds found! Add a new hold (currency: {currency}):",
+            reply_markup=ReplyKeyboardMarkup([['➕ Add Hold'], ['🔙 Back']], resize_keyboard=True))
+        return MAIN_MENU
+
+    holds_list = "\n".join(
+        f"{idx+1}. {format_money(hold['amount'], currency)} - {hold['description']}" 
+        for idx, hold in enumerate(holds)
+    )
+
+    await update.message.reply_text(
+        f"⏳ Your holds:\n{holds_list}\n\nSelect an action:",
+        reply_markup=ReplyKeyboardMarkup(
+            [['➕ Add Hold'], ['🛠 Manage Hold'], ['🔙 Back']], 
+            resize_keyboard=True
+        )
+    )
+    return MAIN_MENU
 
 async def manage_hold_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
@@ -437,7 +551,7 @@ async def manage_hold_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     keyboard = [
         [InlineKeyboardButton(
-            f"{format_money(hold['amount'])} - {hold['description']}", 
+            f"{format_money(hold['amount'], hold['currency'] if 'currency' in hold.keys() else 'USD')} - {hold['description']}", 
             callback_data=f"hold_{hold['id']}"
         )] 
         for hold in holds
@@ -457,8 +571,10 @@ async def hold_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     with get_db_connection() as conn:
         hold = conn.execute("SELECT * FROM holds WHERE id = ?", (hold_id,)).fetchone()
 
+    currency = hold['currency'] if 'currency' in hold.keys() else 'USD'
+    
     await query.edit_message_text(
-        text=f"Hold selected: {format_money(hold['amount'])} - {hold['description']}\nChoose action:",
+        text=f"Hold selected: {format_money(hold['amount'], currency)} - {hold['description']}\nChoose action:",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("➡️ To Income", callback_data=f"transfer_income_{hold_id}"),
              InlineKeyboardButton("⬅️ To Outcome", callback_data=f"transfer_outcome_{hold_id}")],
@@ -476,20 +592,23 @@ async def transfer_hold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     with get_db_connection() as conn:
         hold = conn.execute("SELECT * FROM holds WHERE id = ?", (hold_id,)).fetchone()
+        currency = hold['currency'] if 'currency' in hold.keys() else 'USD'
         
         # Add to transactions
         transaction_type = 'income' if action == 'income' else 'outcome'
         sign = 1 if action == 'income' else -1
         conn.execute(
-            "INSERT INTO transactions (user_id, type, amount, description, date) VALUES (?, ?, ?, ?, ?)",
-            (user_id, transaction_type, sign * hold['amount'], f"From hold: {hold['description']}", get_current_datetime())
+            "INSERT INTO transactions (user_id, type, amount, description, date, currency) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, transaction_type, sign * hold['amount'], 
+             f"From hold: {hold['description']}", get_current_datetime(), currency)
         )
         
         # Remove hold
         conn.execute("DELETE FROM holds WHERE id = ?", (hold_id,))
 
     await query.edit_message_text(
-        f"✅ Transferred {format_money(hold['amount'])} to {transaction_type.capitalize()}")
+        f"✅ Transferred {format_money(hold['amount'], currency)} to {transaction_type.capitalize()}")
     return await start_over(update, context)
 
 async def remove_hold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -519,12 +638,28 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
     return MAIN_MENU
 
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log errors caused by updates."""
+    logger.error('Update "%s" caused error "%s"', update, context.error)
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "An error occurred. Please try again.",
+            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
+        )
+
 def main() -> None:
     # Initialize database
     init_db()
 
-    # Create application
+    # Create application with job queue
     application = Application.builder().token("8017763140:AAG9PeLy2ktLG5Q6ZGjTI7B8nk7eHVSxemw").build()
+    application.add_error_handler(error_handler)
+
+    # Add job queue for recurring transactions
+    job_queue = application.job_queue
+    if job_queue:
+        job_queue.run_daily(process_recurring_transactions, 
+                          time=datetime.time(hour=0, minute=0, tzinfo=TIMEZONE))
 
     # Conversation handler
     conv_handler = ConversationHandler(
@@ -535,13 +670,11 @@ def main() -> None:
                 MessageHandler(filters.Regex(r'^📥 Income$'), income_menu),
                 MessageHandler(filters.Regex(r'^📤 Outcome$'), outcome_menu),
                 MessageHandler(filters.Regex(r'^⏳ Holds$'), holds_menu),
-                MessageHandler(filters.Regex(r'^📊 Statistics$'), show_statistics),
-                MessageHandler(filters.Regex(r'^🗂 Categories$'), category_menu),
+                MessageHandler(filters.Regex(r'^🔄 Recurring$'), recurring_menu),
+                MessageHandler(filters.Regex(r'^💱 Currency$'), currency_menu),
                 MessageHandler(filters.Regex(r'^➕ Add Hold$'), add_hold_prompt),
                 MessageHandler(filters.Regex(r'^🛠 Manage Hold$'), manage_hold_menu),
-                MessageHandler(filters.Regex(r'^📥 Income Categories$'), show_categories),
-                MessageHandler(filters.Regex(r'^📤 Expense Categories$'), show_categories),
-                MessageHandler(filters.Regex(r'^➕ Add Category$'), add_category_prompt),
+                MessageHandler(filters.Regex(r'^📋 List Recurring$'), list_recurring),
                 MessageHandler(filters.Regex(r'^🔙 Back$'), start),
             ],
             ADD_INCOME: [
@@ -556,16 +689,30 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_hold),
                 MessageHandler(filters.Regex(r'^❌ Cancel$'), cancel)
             ],
-            SET_CATEGORY: [
-                MessageHandler(filters.Regex(r'^(Income|Outcome)$'), set_category_type),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_category),
+            RECURRING_MENU: [
+                MessageHandler(filters.Regex(r'^➕ Add Recurring$'), add_recurring_prompt),
+    MessageHandler(filters.Regex(r'^📋 List Recurring$'), list_recurring),
+    CallbackQueryHandler(manage_recurring, pattern=r"^recur_"),
+    CallbackQueryHandler(remove_recurring, pattern=r"^remove_recur_"),
+    CallbackQueryHandler(edit_recurring_prompt, pattern=r"^edit_recur_"),
+    CallbackQueryHandler(start_over, pattern=r"^back_recur_list"),
+    CallbackQueryHandler(start_over, pattern=r"^back_main"),  # Add this new handler
+    MessageHandler(filters.Regex(r'^🔙 Back$'), start),
+            ],
+            ADD_RECURRING: [
+                MessageHandler(filters.Regex(r'^(Income|Outcome)$'), add_recurring_type),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_recurring),
                 MessageHandler(filters.Regex(r'^❌ Cancel$'), cancel)
+            ],
+            CURRENCY_MENU: [
+                CallbackQueryHandler(set_currency, pattern=r"^currency_"),
+                CallbackQueryHandler(start_over, pattern=r"^back_currency")
             ],
             MANAGE_HOLDS: [
                 CallbackQueryHandler(hold_action, pattern=r"^hold_"),
                 CallbackQueryHandler(transfer_hold, pattern=r"^transfer_(income|outcome)_"),
                 CallbackQueryHandler(remove_hold, pattern=r"^remove_"),
-                CallbackQueryHandler(start_over, pattern=r"^back_")
+                CallbackQueryHandler(start_over, pattern=r"^back_holds")
             ]
         },
         fallbacks=[CommandHandler('start', start)],
