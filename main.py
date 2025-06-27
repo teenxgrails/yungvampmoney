@@ -672,7 +672,7 @@ def main() -> None:
     init_db()
 
     # Create application with job queue
-    application = Application.builder().token("7847351145:AAEgUwSdwpYoLANB06PumVfTeQEH-I85EbM").build()
+    application = Application.builder().token("8017763140:AAG9PeLy2ktLG5Q6ZGjTI7B8nk7eHVSxemw").build()
     application.add_error_handler(error_handler)
 
     # Add job queue for recurring transactions
