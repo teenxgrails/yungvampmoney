@@ -127,56 +127,22 @@ async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         balance = income + outcome
         total_expenses = -outcome if outcome < 0 else outcome
 
-        # Get last 5 transactions
+        # Get all transactions
         transactions = conn.execute(
             "SELECT * FROM transactions WHERE user_id = ? "
-            "ORDER BY date DESC LIMIT 5",
+            "ORDER BY date DESC",
             (user_id,)
         ).fetchall()
 
-    # Create the visualization
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
+    # Create the visualization (just the pie chart now)
+    fig, ax = plt.subplots(figsize=(8, 6))
     
     # Balance overview pie chart
     labels = ['Income', 'Expenses', 'Holds']
     sizes = [income, total_expenses, holds]
     colors = ['#4CAF50', '#F44336', '#FFC107']
-    ax1.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
-    ax1.set_title(f'Budget Overview ({currency})', pad=20)
-    
-    # Transaction history table
-    transaction_data = []
-    for t in transactions:
-        trans_type = "Income" if t['type'] == 'income' else "Expense"
-        amount = t['amount'] if t['amount'] > 0 else -t['amount']
-        date = t['date'].split()[0] if t['date'] else 'no date'
-        trans_currency = t['currency'] if 'currency' in t.keys() else currency
-        transaction_data.append([
-            date, 
-            trans_type, 
-            f"{format_money(amount, trans_currency)}", 
-            t['description'][:20] + '...' if len(t['description']) > 20 else t['description']
-        ])
-    
-    # Create transaction table
-    if transactions:
-        columns = ['Date', 'Type', 'Amount', 'Description']
-        ax2.axis('off')
-        table = ax2.table(cellText=transaction_data,
-                         colLabels=columns,
-                         cellLoc='center',
-                         loc='center',
-                         colColours=['#f5f5f5']*4)
-        table.auto_set_font_size(False)
-        table.set_fontsize(10)
-        table.scale(1, 1.5)
-        ax2.set_title('Recent Transactions', pad=20)
-    else:
-        ax2.text(0.5, 0.5, 'No transactions yet', 
-                horizontalalignment='center',
-                verticalalignment='center',
-                fontsize=12)
-        ax2.axis('off')
+    ax.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
+    ax.set_title(f'Budget Overview ({currency})', pad=20)
 
     plt.tight_layout()
     
@@ -191,8 +157,28 @@ async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         f"💰 Current Balance: {format_money(balance, currency)}\n"
         f"📥 Total Income: {format_money(income, currency)}\n"
         f"📤 Total Expenses: {format_money(total_expenses, currency)}\n"
-        f"⏳ Held Amount: {format_money(holds, currency)}"
+        f"⏳ Held Amount: {format_money(holds, currency)}\n"
+        f"Currency: {currency} {CURRENCIES.get(currency, '')}\n\n"
     )
+    
+    # Prepare transaction history
+    if transactions:
+        trans_history = "📜 Transaction History:\n"
+        trans_history += "Date       | Type    | Amount      | Description\n"
+        trans_history += "--------------------------------------------\n"
+        
+        for t in transactions:
+            date = format_transaction_date(t['date'])
+            trans_type = "Income" if t['type'] == 'income' else "Expense"
+            amount = t['amount'] if t['amount'] > 0 else -t['amount']
+            trans_currency = t['currency'] if 'currency' in t.keys() else currency
+            description = t['description'][:20] + '...' if len(t['description']) > 20 else t['description']
+            
+            trans_history += f"{date:<10} | {trans_type:<7} | {format_money(amount, trans_currency):<12} | {description}\n"
+    else:
+        trans_history = "No transactions yet"
+    
+    full_message = text_summary + trans_history
     
     # Send the graphic and text
     if update.message:
@@ -201,10 +187,18 @@ async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             caption=text_summary,
             reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
         )
+        await update.message.reply_text(
+            trans_history,
+            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
+        )
     else:
         await update.callback_query.message.reply_photo(
             photo=buf,
             caption=text_summary,
+            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
+        )
+        await update.callback_query.message.reply_text(
+            trans_history,
             reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
         )
     return MAIN_MENU
@@ -222,8 +216,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         f"Welcome to Budget Planner, {user.first_name}!\n"
         "Use the buttons below to manage your finances:",
-        reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
-    )
+        reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
     return MAIN_MENU
 
 async def currency_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -275,8 +268,8 @@ async def add_recurring_type(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(
         "Enter details in format:\n"
         "<b>Amount DayOfMonth Description</b>\n"
-        "Example: 1000 5 Salary\n"
-        "DayOfMonth should be between 1-28",
+        "Example: 1000 15 Salary\n"
+        "DayOfMonth should be between 1-31",
         reply_markup=ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True),
         parse_mode="HTML")
     return ADD_RECURRING
@@ -297,8 +290,8 @@ async def add_recurring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         day = int(text[1])
         description = ' '.join(text[2:]) if len(text) > 2 else "Recurring"
         
-        if not 1 <= day <= 28:
-            raise ValueError("Day must be between 1-28")
+        if not 1 <= day <= 31:
+            raise ValueError("Day must be between 1-31")
 
         with get_db_connection() as conn:
             conn.execute(
@@ -314,7 +307,7 @@ async def add_recurring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await update.message.reply_text(
             f"❌ Invalid format: {str(e)}\n"
             "Please enter: Amount DayOfMonth Description\n"
-            "Example: 1000 5 Salary",
+            "Example: 1000 15 Salary",
             reply_markup=ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True))
         return ADD_RECURRING
 
@@ -356,15 +349,19 @@ async def manage_recurring(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         recurring = conn.execute("SELECT * FROM recurring WHERE id = ?", 
                               (recurring_id,)).fetchone()
 
+    currency = recurring['currency'] if 'currency' in recurring.keys() else 'USD'
+    
     await query.edit_message_text(
         text=f"Recurring transaction selected:\n"
              f"Type: {recurring['type'].capitalize()}\n"
-             f"Amount: {format_money(recurring['amount'], recurring['currency'])}\n"
+             f"Amount: {format_money(recurring['amount'], currency)}\n"
              f"Day: {recurring['day_of_month']}\n"
-             f"Description: {recurring['description']}\n\n"
+             f"Description: {recurring['description']}\n"
+             f"Currency: {currency} {CURRENCIES.get(currency, '')}\n\n"
              "Choose action:",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Remove", callback_data=f"remove_recur_{recurring_id}")],
+            [InlineKeyboardButton("✏️ Edit", callback_data=f"edit_recur_{recurring_id}"),
+             InlineKeyboardButton("❌ Remove", callback_data=f"remove_recur_{recurring_id}")],
             [InlineKeyboardButton("🔙 Back", callback_data="back_recur_list")]
         ]))
     return RECURRING_MENU
@@ -386,11 +383,19 @@ async def edit_recurring_prompt(update: Update, context: ContextTypes.DEFAULT_TY
     recurring_id = query.data.split('_')[2]
     context.user_data['editing_recurring'] = recurring_id
 
+    with get_db_connection() as conn:
+        recurring = conn.execute("SELECT * FROM recurring WHERE id = ?", 
+                              (recurring_id,)).fetchone()
+    
+    currency = recurring['currency'] if 'currency' in recurring.keys() else 'USD'
+    
     await query.edit_message_text(
+        f"Editing recurring transaction:\n"
+        f"Current: {format_money(recurring['amount'], currency)} on day {recurring['day_of_month']} - {recurring['description']}\n\n"
         "Enter new details in format:\n"
         "<b>Amount DayOfMonth Description</b>\n"
-        "Example: 1000 5 Salary\n"
-        "DayOfMonth should be between 1-28",
+        "Example: 1000 15 Salary\n"
+        "DayOfMonth should be between 1-31",
         parse_mode="HTML"
     )
     return ADD_RECURRING
@@ -404,28 +409,25 @@ async def edit_recurring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         day = int(text[1])
         description = ' '.join(text[2:]) if len(text) > 2 else "Recurring"
         
-        if not 1 <= day <= 28:
-            raise ValueError("Day must be between 1-28")
+        if not 1 <= day <= 31:
+            raise ValueError("Day must be between 1-31")
 
         with get_db_connection() as conn:
-            recurring = conn.execute("SELECT * FROM recurring WHERE id = ?",
-                                   (context.user_data['editing_recurring'],)).fetchone()
-            
             conn.execute(
                 "UPDATE recurring SET amount = ?, day_of_month = ?, description = ? WHERE id = ?",
                 (amount, day, description, context.user_data['editing_recurring'])
             )
 
         context.user_data.pop('editing_recurring', None)
+        await update.message.reply_text("✅ Recurring transaction updated successfully!")
         return await show_balance_menu(update, context)
 
     except (ValueError, IndexError) as e:
-        keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="back_recur_list")]]
         await update.message.reply_text(
             f"❌ Invalid format: {str(e)}\n"
             "Please enter: Amount DayOfMonth Description\n"
-            "Example: 1000 5 Salary",
-            reply_markup=InlineKeyboardMarkup(keyboard))
+            "Example: 1000 15 Salary",
+            reply_markup=ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True))
         return ADD_RECURRING
 
 async def income_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -484,14 +486,14 @@ async def add_outcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     currency = get_user_currency(user_id)
 
     try:
-        amount = float(text[0]) * -1  # Store as negative
+        amount = float(text[0])
         description = ' '.join(text[1:]) if len(text) > 1 else "Expense"
 
         with get_db_connection() as conn:
             conn.execute(
                 "INSERT INTO transactions (user_id, type, amount, description, date, currency) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                (user_id, 'outcome', amount, description, get_current_datetime(), currency)
+                (user_id, 'outcome', -amount, description, get_current_datetime(), currency)
             )
 
         return await show_balance_menu(update, context)
@@ -516,7 +518,7 @@ async def holds_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return MAIN_MENU
 
     holds_list = "\n".join(
-        f"{idx+1}. {format_money(hold['amount'], currency)} - {hold['description']}" 
+        f"{idx+1}. {format_money(hold['amount'], hold['currency'])} - {hold['description']}" 
         for idx, hold in enumerate(holds)
     )
 
@@ -578,11 +580,12 @@ async def manage_hold_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     keyboard = [
         [InlineKeyboardButton(
-            f"{format_money(hold['amount'], hold['currency'] if 'currency' in hold.keys() else 'USD')} - {hold['description']}", 
+            f"{format_money(hold['amount'], hold['currency'])} - {hold['description']}", 
             callback_data=f"hold_{hold['id']}"
         )] 
         for hold in holds
     ]
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_holds")])
 
     await update.message.reply_text(
         "Select a hold to manage:",
@@ -604,7 +607,7 @@ async def hold_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         text=f"Hold selected: {format_money(hold['amount'], currency)} - {hold['description']}\nChoose action:",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("➡️ To Income", callback_data=f"transfer_income_{hold_id}"),
-             InlineKeyboardButton("⬅️ To Outcome", callback_data=f"transfer_outcome_{hold_id}")],
+             InlineKeyboardButton("⬅️ To Expense", callback_data=f"transfer_outcome_{hold_id}")],
             [InlineKeyboardButton("❌ Remove", callback_data=f"remove_{hold_id}")],
             [InlineKeyboardButton("🔙 Back", callback_data="back_holds")]
         ]))
@@ -620,14 +623,18 @@ async def transfer_hold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         hold = conn.execute("SELECT * FROM holds WHERE id = ?", (hold_id,)).fetchone()
         currency = hold['currency'] if 'currency' in hold.keys() else 'USD'
         
+        # Create transaction
+        trans_type = 'income' if action == 'income' else 'outcome'
+        amount = hold['amount'] if action == 'income' else -hold['amount']
+        description = f"{'Released' if action == 'income' else 'Spent'} hold: {hold['description']}"
+        
         conn.execute(
             "INSERT INTO transactions (user_id, type, amount, description, date, currency) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, 'income' if action == 'income' else 'outcome', 
-             1 if action == 'income' else -1 * hold['amount'], 
-             f"From hold: {hold['description']}", get_current_datetime(), currency)
+            (user_id, trans_type, amount, description, get_current_datetime(), currency)
         )
         
+        # Remove hold
         conn.execute("DELETE FROM holds WHERE id = ?", (hold_id,))
 
     return await show_balance_menu(update, context)
@@ -672,7 +679,7 @@ def main() -> None:
     init_db()
 
     # Create application with job queue
-    application = Application.builder().token("8017763140:AAG9PeLy2ktLG5Q6ZGjTI7B8nk7eHVSxemw").build()
+    application = Application.builder().token("8017763140:AAHD8fI9orJbnIyljuWF8PZN6yBmDxKuPrw").build()
     application.add_error_handler(error_handler)
 
     # Add job queue for recurring transactions
@@ -695,7 +702,7 @@ def main() -> None:
                 MessageHandler(filters.Regex(r'^➕ Add Hold$'), add_hold_prompt),
                 MessageHandler(filters.Regex(r'^🛠 Manage Hold$'), manage_hold_menu),
                 MessageHandler(filters.Regex(r'^📋 List Recurring$'), list_recurring),
-                MessageHandler(filters.Regex(r'^🔙 Back$'), start),
+                MessageHandler(filters.Regex(r'^🔙 Back$'), start_over),
             ],
             ADD_INCOME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_income),
@@ -712,12 +719,12 @@ def main() -> None:
             RECURRING_MENU: [
                 MessageHandler(filters.Regex(r'^➕ Add Recurring$'), add_recurring_prompt),
                 MessageHandler(filters.Regex(r'^📋 List Recurring$'), list_recurring),
+                MessageHandler(filters.Regex(r'^🔙 Back$'), start_over),
                 CallbackQueryHandler(manage_recurring, pattern=r"^recur_"),
                 CallbackQueryHandler(remove_recurring, pattern=r"^remove_recur_"),
                 CallbackQueryHandler(edit_recurring_prompt, pattern=r"^edit_recur_"),
                 CallbackQueryHandler(start_over, pattern=r"^back_recur_list"),
-                CallbackQueryHandler(start_over, pattern=r"^back_main"),
-                MessageHandler(filters.Regex(r'^🔙 Back$'), start),
+                CallbackQueryHandler(start_over, pattern=r"^back_recurring"),
             ],
             ADD_RECURRING: [
                 MessageHandler(filters.Regex(r'^(Income|Outcome)$'), add_recurring_type),
