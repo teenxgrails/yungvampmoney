@@ -43,7 +43,7 @@ def init_db():
 
 # --- Constants --- #
 MAIN_MENU, ADD_INCOME, ADD_OUTCOME, ADD_HOLD, MANAGE_HOLDS, \
-RECURRING_MENU, ADD_RECURRING, CURRENCY_MENU = range(8)
+RECURRING_MENU, ADD_RECURRING, CURRENCY_MENU, MANAGE_TRANSACTIONS = range(9)
 TIMEZONE = pytz.timezone('Europe/Moscow')
 CURRENCIES = {
     'USD': '$',
@@ -56,9 +56,9 @@ CURRENCIES = {
 
 # Keyboard layouts
 main_keyboard = [
-    ['💰 Balance', '📥 Income'], 
-    ['📤 Outcome', '⏳ Holds'],
-    ['🔄 Recurring', '💱 Currency']
+    ['💰 Balance' ], 
+    ['📥 Income', '📤 Outcome', ],
+    ['⏳ Holds', '🔄 Recurring', '💱 Currency', '🗑 Transactions']
 ]
 cancel_keyboard = [['❌ Cancel']]
 
@@ -70,6 +70,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Helper Functions --- #
+def format_transaction_date_long(db_date):
+    if not db_date:
+        return "no date"
+    try:
+        dt = datetime.datetime.strptime(db_date, "%Y-%m-%d %H:%M:%S")
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except:
+        return db_date.split()[0] if db_date else "no date"
+    
 def format_transaction_date(db_date):
     if not db_date:
         return "no date"
@@ -87,10 +96,73 @@ def get_user_currency(user_id):
 
 def format_money(amount, currency='USD'):
     symbol = CURRENCIES.get(currency, '$')
-    return f"{symbol}{abs(amount):.2f}"
+    
+    # European-style number formatting:
+    # - Comma as decimal separator
+    # - Space as thousand separator
+    # - 2 decimal places
+    formatted_amount = "{:,.2f}".format(abs(amount)).replace(",", " ").replace(".", ",")
+    
+    # Handle currency symbol placement
+    if currency in ['USD', 'GBP', 'JPY', 'RUB']:  # Prefix symbols
+        return f"{symbol}{formatted_amount}"
+    elif currency in ['EUR', 'CHF']:  # Suffix symbols
+        return f"{formatted_amount}{symbol}"
+    else:  # Default prefix
+        return f"{symbol}{formatted_amount}"
+
 
 def get_current_datetime():
     return datetime.datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+
+async def show_transactions_for_deletion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.message.from_user.id
+    currency = get_user_currency(user_id)
+    
+    with get_db_connection() as conn:
+        transactions = conn.execute(
+            "SELECT * FROM transactions WHERE user_id = ? "
+            "ORDER BY date DESC LIMIT 50",  # Limit to 50 most recent for practicality
+            (user_id,)
+        ).fetchall()
+
+    if not transactions:
+        await update.message.reply_text(
+            "No transactions found!",
+            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+        return MAIN_MENU
+
+    keyboard = []
+    for idx, t in enumerate(transactions, 1):
+        date = format_transaction_date(t['date'])
+        trans_type = "Income" if t['type'] == 'income' else "Expense"
+        amount = t['amount'] if t['amount'] > 0 else -t['amount']
+        trans_currency = t['currency'] if 'currency' in t.keys() else currency
+        description = t['description'][:20] + '...' if len(t['description']) > 20 else t['description']
+        
+        button_text = (
+            f"{idx}. {date} | {trans_type} | "
+            f"{format_money(amount, trans_currency)} | {description}"
+        )
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"del_trans_{t['id']}")])
+
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_transactions")])
+
+    await update.message.reply_text(
+        "Select a transaction to delete:",
+        reply_markup=InlineKeyboardMarkup(keyboard))
+    return MANAGE_TRANSACTIONS
+
+async def delete_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    trans_id = query.data.split('_')[2]
+
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM transactions WHERE id = ?", (trans_id,))
+
+    await query.edit_message_text("✅ Transaction deleted successfully!")
+    return await show_balance_menu(update, context)
 
 async def process_recurring_transactions(context: ContextTypes.DEFAULT_TYPE):
     today = datetime.datetime.now(TIMEZONE).day
@@ -117,7 +189,6 @@ async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     currency = get_user_currency(user_id)
     
     with get_db_connection() as conn:
-        # Get balance data
         income = conn.execute("SELECT SUM(amount) FROM transactions WHERE user_id = ? AND type = 'income'", 
                             (user_id,)).fetchone()[0] or 0
         outcome = conn.execute("SELECT SUM(amount) FROM transactions WHERE user_id = ? AND type = 'outcome'", 
@@ -127,45 +198,72 @@ async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         balance = income + outcome
         total_expenses = -outcome if outcome < 0 else outcome
 
-        # Get all transactions
         transactions = conn.execute(
             "SELECT * FROM transactions WHERE user_id = ? "
-            "ORDER BY date DESC",
+            "ORDER BY date DESC LIMIT 50",  # Limit to 50 for practical reasons
             (user_id,)
         ).fetchall()
 
-    # Create the visualization (just the pie chart now)
-    fig, ax = plt.subplots(figsize=(8, 6))
+    # iOS-style visualization with European numbers
+    plt.style.use('default')
+    fig, ax = plt.subplots(figsize=(8, 6), facecolor='#F2F2F7')
+    fig.patch.set_alpha(0)
     
-    # Balance overview pie chart
-    labels = ['Income', 'Expenses', 'Holds']
+    ios_colors = {
+        'income': '#32D74B',
+        'expenses': '#FF453A',
+        'holds': '#FF9F0A',
+        'background': '#F2F2F7',
+        'text': '#1C1C1E'
+    }
+    
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.grid(False)
+    
     sizes = [income, total_expenses, holds]
-    colors = ['#4CAF50', '#F44336', '#FFC107']
-    ax.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
-    ax.set_title(f'Budget Overview ({currency})', pad=20)
-
+    labels = [f'Income\n{format_money(income, currency)}', 
+              f'Expenses\n{format_money(total_expenses, currency)}', 
+              f'Holds\n{format_money(holds, currency)}']
+    colors = [ios_colors['income'], ios_colors['expenses'], ios_colors['holds']]
+    
+    wedges, texts = ax.pie(sizes, colors=colors, startangle=90, 
+                          wedgeprops=dict(width=0.5, edgecolor='none'))
+    
+    for text in texts:
+        text.set_color(ios_colors['text'])
+        text.set_fontsize(10)
+        text.set_fontweight('medium')
+    
+    center_text = f"Balance\n{format_money(balance, currency)}"
+    ax.text(0, 0, center_text, ha='center', va='center', 
+           fontsize=18, fontweight='bold', color=ios_colors['text'])
+    
+    for wedge in wedges:
+        wedge.set_edgecolor('#D1D1D6')
+        wedge.set_linewidth(0.5)
+    
     plt.tight_layout()
     
-    # Save to bytes buffer
     buf = BytesIO()
-    plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    plt.savefig(buf, format='png', dpi=120, transparent=True, 
+               bbox_inches='tight', pad_inches=0.1)
     buf.seek(0)
     plt.close()
     
-    # Prepare text summary
+    # Prepare European-style formatted text
     text_summary = (
-        f"💰 Current Balance: {format_money(balance, currency)}\n"
-        f"📥 Total Income: {format_money(income, currency)}\n"
-        f"📤 Total Expenses: {format_money(total_expenses, currency)}\n"
-        f"⏳ Held Amount: {format_money(holds, currency)}\n"
-        f"Currency: {currency} {CURRENCIES.get(currency, '')}\n\n"
+        f"💳 *Current Balance*: {format_money(balance, currency)}\n"
+        f"📈 *Total Income*: {format_money(income, currency)}\n"
+        f"📉 *Total Expenses*: {format_money(total_expenses, currency)}\n"
+        f"⏳ *Held Amount*: {format_money(holds, currency)}\n"
+        f"🌍 *Currency*: {currency} {CURRENCIES.get(currency, '')}\n\n"
     )
     
-    # Prepare transaction history
     if transactions:
-        trans_history = "📜 Transaction History:\n"
-        trans_history += "Date       | Type    | Amount      | Description\n"
-        trans_history += "--------------------------------------------\n"
+        trans_history = "📜 *Transaction History*\n"
+        trans_history += "` Date    | Type    | Amount        | Description `\n"
+        trans_history += "`-----------------------------------------------`\n"
         
         for t in transactions:
             date = format_transaction_date(t['date'])
@@ -174,31 +272,38 @@ async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             trans_currency = t['currency'] if 'currency' in t.keys() else currency
             description = t['description'][:20] + '...' if len(t['description']) > 20 else t['description']
             
-            trans_history += f"{date:<10} | {trans_type:<7} | {format_money(amount, trans_currency):<12} | {description}\n"
+            # Properly format each column
+            trans_history += (
+                f"`{date:<8} | {trans_type:<7} | "
+                f"{format_money(amount, trans_currency):<13} | "
+                f"{description}`\n"
+            )
     else:
         trans_history = "No transactions yet"
     
-    full_message = text_summary + trans_history
-    
-    # Send the graphic and text
+    # Send messages
     if update.message:
         await update.message.reply_photo(
             photo=buf,
             caption=text_summary,
+            parse_mode='Markdown',
             reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
         )
         await update.message.reply_text(
             trans_history,
+            parse_mode='Markdown',
             reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
         )
     else:
         await update.callback_query.message.reply_photo(
             photo=buf,
             caption=text_summary,
+            parse_mode='Markdown',
             reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
         )
         await update.callback_query.message.reply_text(
             trans_history,
+            parse_mode='Markdown',
             reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
         )
     return MAIN_MENU
@@ -679,7 +784,14 @@ def main() -> None:
     init_db()
 
     # Create application with job queue
-    application = Application.builder().token("8017763140:AAHD8fI9orJbnIyljuWF8PZN6yBmDxKuPrw").build()
+    try:
+        # IMPORTANT: Replace with your actual token or use environment variables
+        TOKEN = "8017763140:AAHD8fI9orJbnIyljuWF8PZN6yBmDxKuPrw"
+        application = Application.builder().token(TOKEN).build()
+    except Exception as e:
+        logger.error(f"Failed to create application: {e}")
+        return
+
     application.add_error_handler(error_handler)
 
     # Add job queue for recurring transactions
@@ -703,6 +815,7 @@ def main() -> None:
                 MessageHandler(filters.Regex(r'^🛠 Manage Hold$'), manage_hold_menu),
                 MessageHandler(filters.Regex(r'^📋 List Recurring$'), list_recurring),
                 MessageHandler(filters.Regex(r'^🔙 Back$'), start_over),
+                MessageHandler(filters.Regex(r'^🗑 Transactions$'), show_transactions_for_deletion),
             ],
             ADD_INCOME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_income),
@@ -741,7 +854,11 @@ def main() -> None:
                 CallbackQueryHandler(transfer_hold, pattern=r"^transfer_(income|outcome)_"),
                 CallbackQueryHandler(remove_hold, pattern=r"^remove_"),
                 CallbackQueryHandler(start_over, pattern=r"^back_holds")
-            ]
+            ],
+            MANAGE_TRANSACTIONS: [
+    CallbackQueryHandler(delete_transaction, pattern=r"^del_trans_"),
+    CallbackQueryHandler(start_over, pattern=r"^back_transactions")
+]
         },
         fallbacks=[CommandHandler('start', start)],
         allow_reentry=True
@@ -750,7 +867,10 @@ def main() -> None:
     application.add_handler(conv_handler)
     
     # Start the Bot
-    application.run_polling()
+    try:
+        application.run_polling()
+    except Exception as e:
+        logger.error(f"Bot failed to start: {e}")
 
 if __name__ == '__main__':
     main()
