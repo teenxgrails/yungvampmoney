@@ -267,15 +267,15 @@ async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         
         for t in transactions:
             date = format_transaction_date(t['date'])
-            trans_type = "Income" if t['type'] == 'income' else "Expense"
+            trans_type = "🟢" if t['type'] == 'income' else "🔴"
             amount = t['amount'] if t['amount'] > 0 else -t['amount']
             trans_currency = t['currency'] if 'currency' in t.keys() else currency
             description = t['description'][:20] + '...' if len(t['description']) > 20 else t['description']
             
             # Properly format each column
             trans_history += (
-                f"`{date:<8} | {trans_type:<7} | "
-                f"{format_money(amount, trans_currency):<13} | "
+                f"`{trans_type:<1} | {date:<5} | "
+                f"{format_money(amount, trans_currency):<7} | "
                 f"{description}`\n"
             )
     else:
