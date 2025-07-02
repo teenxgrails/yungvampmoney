@@ -262,7 +262,7 @@ async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     
     if transactions:
         trans_history = "📜 *Transaction History*\n"
-        trans_history += "` Date    | Type    | Amount        | Description `\n"
+        trans_history += "` Type |  Date  |   Amount   | Description `\n"
         trans_history += "`-----------------------------------------------`\n"
         
         for t in transactions:
