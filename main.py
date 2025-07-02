@@ -2,6 +2,7 @@ import datetime
 import logging
 import sqlite3
 import pytz
+import subprocess
 import matplotlib.pyplot as plt
 from io import BytesIO
 from telegram import (
@@ -307,6 +308,41 @@ async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
         )
     return MAIN_MENU
+
+from telegram.ext import CommandHandler
+import subprocess
+
+# Обработчик команды /updatecode1
+async def update_code1(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    # Замените на свой Telegram ID, чтобы защитить команду
+    if user_id != 676453411:
+        await update.message.reply_text("⛔️ У вас нет прав на выполнение этой команды.")
+        return
+
+    await update.message.reply_text("🔄 Обновляю код...")
+
+    try:
+        # git pull
+        git_result = subprocess.run(
+            ["git", "pull"],
+            cwd="/root/bot",
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        # systemctl restart
+        subprocess.run(
+            ["systemctl", "restart", "bot"],
+            check=True
+        )
+
+        await update.message.reply_text(f"✅ Готово!\n\n<code>{git_result.stdout.strip()}</code>", parse_mode="HTML")
+
+    except subprocess.CalledProcessError as e:
+        await update.message.reply_text(f"❌ Ошибка:\n<code>{e.stderr}</code>", parse_mode="HTML")
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.message.from_user
@@ -793,6 +829,7 @@ def main() -> None:
         return
 
     application.add_error_handler(error_handler)
+    application.add_handler(CommandHandler("updatecode1", update_code1))
 
     # Add job queue for recurring transactions
     job_queue = application.job_queue
