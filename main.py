@@ -100,7 +100,7 @@ def init_db():
 # --- Constants --- #
 MAIN_MENU, ADD_INCOME, ADD_OUTCOME, ADD_HOLD, MANAGE_HOLDS, \
 RECURRING_MENU, ADD_RECURRING, CURRENCY_MENU, MANAGE_TRANSACTIONS, \
-SET_BUDGET, REPORT_MENU, BACKUP, WALLET_MENU, ADD_WALLET, SETTINGS_MENU = range(15)
+SET_BUDGET, REPORT_MENU, BACKUP, WALLET_MENU, ADD_WALLET, SETTINGS_MENU, CHOOSE_WALLET_INCOME, CHOOSE_WALLET_OUTCOME = range(17)
 
 OXR_API_KEY = '390ab2a864c98873f38df1de'
 CURRENCY_API = f"https://open.er-api.com/v6/latest/USD?apikey={OXR_API_KEY}"
@@ -119,7 +119,7 @@ CURRENCIES = {
 CATEGORIES = {
     'Food': ['mcdonalds', 'burger', 'restaurant', 'cafe', 'groceries', 'food', 'eat'],
     'Transport': ['taxi', 'uber', 'metro', 'transport', 'gas', 'fuel', 'parking'],
-    'Housing': ['rent', 'mortgage', 'utilities', 'electricity', 'water', 'internet'],
+    'Housing': ['rent', 'mortgage', 'utilities', 'electricity', 'water', 'internet', 'room'],
     'Entertainment': ['movie', 'netflix', 'concert', 'game', 'hobby'],
     'Healthcare': ['pharmacy', 'doctor', 'hospital', 'medicine', 'insurance'],
     'Income': ['salary', 'bonus', 'freelance', 'payment', 'invoice'],
@@ -158,7 +158,7 @@ def format_transaction_date_long(db_date):
         dt = datetime.datetime.strptime(db_date, "%Y-%m-%d %H:%M:%S")
         return dt.strftime("%Y-%m-%d %H:%M")
     except:
-        return db_date.split()[0] if db_date else "no date"
+        return db_date
     
 def format_transaction_date(db_date):
     if not db_date:
@@ -704,7 +704,7 @@ async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         f"👛 <b>𝗪𝗮𝗹𝗹𝗲𝘁 𝗕𝗮𝗹𝗮𝗻𝗰𝗲𝘀</b>\n" + "\n".join(wallet_details) + "\n\n"
         
-        f"<b>💳 𝗧𝗼𝘁𝗮𝗹 𝗕𝗮𝗹𝗮𝗻𝗰𝗲:</b> {fm(total_balance):>16}\n"
+        f"<b>💳 𝗧𝗼𝘁𝗮𝗹 𝗕𝗮𝗹𝗮𝗻𝗰𝗲:</b> {fm(total_balance):>16}\n\n"
         #f"<b>🌍 𝗖𝘂𝗿𝗿𝗲𝗻𝗰𝘆:</b> {currency} {currency_symbol:>22}\n\n"
         
         "───────────────\n\n"
@@ -807,26 +807,49 @@ async def update_code1(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔️ You don't have permission to execute this command.")
         return
 
-    await update.message.reply_text("🔄 Updating code...")
-
+    # Send initial response
+    msg = await update.message.reply_text("🔄 Updating code...")
+    
     try:
-        git_result = subprocess.run(
+        # Change to your bot's directory
+        os.chdir("/root/bot")
+        
+        # Git pull
+        git_pull = subprocess.run(
             ["git", "pull"],
-            cwd="/root/bot",
             capture_output=True,
             text=True,
             check=True
         )
-
-        subprocess.run(
-            ["systemctl", "restart", "bot"],
+        git_output = git_pull.stdout.strip()
+        
+        # Restart service
+        restart = subprocess.run(
+            ["sudo", "systemctl", "restart", "bot"],
+            capture_output=True,
+            text=True,
             check=True
         )
-
-        await update.message.reply_text(f"✅ Done!\n\n<code>{git_result.stdout.strip()}</code>", parse_mode="HTML")
-
+        
+        # Format success response
+        response = (
+            f"✅ <b>Update successful!</b>\n\n"
+            f"<b>Git output:</b>\n<code>{git_output}</code>\n\n"
+            f"<b>Service restart:</b>\n<code>Systemd restart completed</code>"
+        )
+        await msg.edit_text(response, parse_mode="HTML")
+        
     except subprocess.CalledProcessError as e:
-        await update.message.reply_text(f"❌ Error:\n<code>{e.stderr}</code>", parse_mode="HTML")
+        error_msg = (
+            f"❌ <b>Update failed!</b>\n\n"
+            f"<b>Command:</b> <code>{' '.join(e.cmd)}</code>\n"
+            f"<b>Exit code:</b> {e.returncode}\n"
+            f"<b>Error output:</b>\n<code>{e.stderr.strip()}</code>"
+        )
+        await msg.edit_text(error_msg, parse_mode="HTML")
+    except Exception as e:
+        logger.exception("Update error")
+        await msg.edit_text(f"❌ Unexpected error: {str(e)}")
 
 async def wallets_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
@@ -1214,21 +1237,48 @@ async def edit_recurring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def income_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
-    currency = get_user_currency(user_id)
+    
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, currency FROM wallets WHERE user_id = ?", (user_id,))
+        wallets = cursor.fetchall()
+    
+    if not wallets:
+        await update.message.reply_text(
+            "No wallets available. Add a wallet first!",
+            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+        return MAIN_MENU
+    
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{wallet['name']} ({wallet['currency']})", 
+            callback_data=f"income_wallet_{wallet['id']}"
+        )]
+        for wallet in wallets
+    ]
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_income")])
     
     await update.message.reply_text(
-        f"➕ Add income in format (currency: {currency}):\n"
-        "<b>Amount</b> (e.g., 1000)\n"
-        "<b>Amount Currency</b> (e.g., 1000 EUR)\n"
-        "<b>Amount Currency Description</b> (e.g., 1000 EUR Salary)",
-        reply_markup=ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True),
-        parse_mode="HTML")
-    return ADD_INCOME
+        "📥 Select wallet for income:",
+        reply_markup=InlineKeyboardMarkup(keyboard))
+    return CHOOSE_WALLET_INCOME
 
 async def add_income(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
     text = update.message.text.split()
-    default_currency = get_user_currency(user_id)
+    
+    # Get selected wallet from context
+    wallet_id = context.user_data.get('income_wallet')
+    if not wallet_id:
+        await update.message.reply_text(
+            "Wallet not selected. Please start over.",
+            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+        return MAIN_MENU
+    
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT currency FROM wallets WHERE id = ?", (wallet_id,))
+        wallet_currency = cursor.fetchone()[0]
     
     try:
         # Parse input
@@ -1238,38 +1288,22 @@ async def add_income(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             description = ' '.join(text[2:]) if len(text) > 2 else "Income"
         else:
             amount = float(text[0])
-            currency = default_currency
+            currency = wallet_currency
             description = ' '.join(text[1:]) if len(text) > 1 else "Income"
         
-        # Get default wallet
+        # Convert amount to wallet currency if needed
+        if currency != wallet_currency:
+            converted_amount = convert_currency(amount, currency, wallet_currency)
+            currency = wallet_currency
+            amount = converted_amount
+        
+        # Insert transaction
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT id, currency FROM wallets WHERE user_id = ? AND is_default = 1",
-                (user_id,)
-            )
-            wallet = cursor.fetchone()
-            
-            if not wallet:
-                await update.message.reply_text(
-                    "❌ No default wallet set. Please create a wallet first.",
-                    reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
-                return MAIN_MENU
-                
-            wallet_id = wallet[0]
-            wallet_currency = wallet[1]
-            
-            # Convert amount to wallet currency if needed
-            if currency != wallet_currency:
-                converted_amount = convert_currency(amount, currency, wallet_currency)
-                currency = wallet_currency
-                amount = converted_amount
-            
-            # Insert transaction
-            cursor.execute(
-                "INSERT INTO transactions (user_id, type, amount, description, date, currency, category_id, wallet_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (user_id, 'income', amount, description, get_current_datetime(), currency, None, wallet_id)
+                "INSERT INTO transactions (user_id, type, amount, description, date, currency, wallet_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (user_id, 'income', amount, description, get_current_datetime(), currency, wallet_id)
             )
             
             # Update wallet balance
@@ -1285,6 +1319,8 @@ async def add_income(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             f"👛 Wallet: {get_wallet_name(wallet_id)}",
             reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
         
+        # Clear temporary data
+        context.user_data.pop('income_wallet', None)
         return MAIN_MENU
 
     except (ValueError, IndexError):
@@ -1296,21 +1332,92 @@ async def add_income(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def outcome_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
-    currency = get_user_currency(user_id)
+    
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, currency FROM wallets WHERE user_id = ?", (user_id,))
+        wallets = cursor.fetchall()
+    
+    if not wallets:
+        await update.message.reply_text(
+            "No wallets available. Add a wallet first!",
+            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+        return MAIN_MENU
+    
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{wallet['name']} ({wallet['currency']})", 
+            callback_data=f"outcome_wallet_{wallet['id']}"
+        )]
+        for wallet in wallets
+    ]
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_outcome")])
     
     await update.message.reply_text(
-        f"➖ Add expense in format (currency: {currency}):\n"
+        "📤 Select wallet for expense:",
+        reply_markup=InlineKeyboardMarkup(keyboard))
+    return CHOOSE_WALLET_OUTCOME
+
+async def wallet_chosen_income(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    wallet_id = int(query.data.split('_')[2])
+    context.user_data['income_wallet'] = wallet_id
+    
+    currency = ""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT currency FROM wallets WHERE id = ?", (wallet_id,))
+        wallet = cursor.fetchone()
+        if wallet:
+            currency = wallet['currency']
+    
+    await query.edit_message_text(
+        f"➕ Add income to {get_wallet_name(wallet_id)} (currency: {currency}):\n"
+        "<b>Amount</b> (e.g., 1000)\n"
+        "<b>Amount Currency</b> (e.g., 1000 EUR)\n"
+        "<b>Amount Currency Description</b> (e.g., 1000 EUR Salary)",
+        parse_mode="HTML")
+    return ADD_INCOME
+
+async def wallet_chosen_outcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    wallet_id = int(query.data.split('_')[2])
+    context.user_data['outcome_wallet'] = wallet_id
+    
+    currency = ""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT currency FROM wallets WHERE id = ?", (wallet_id,))
+        wallet = cursor.fetchone()
+        if wallet:
+            currency = wallet['currency']
+    
+    await query.edit_message_text(
+        f"➖ Add expense from {get_wallet_name(wallet_id)} (currency: {currency}):\n"
         "<b>Amount</b> (e.g., 50)\n"
         "<b>Amount Description</b> (e.g., 50 Groceries)\n"
         "<b>Amount Currency Description</b> (e.g., 50 EUR Dinner)",
-        reply_markup=ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True),
         parse_mode="HTML")
     return ADD_OUTCOME
 
 async def add_outcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
     text = update.message.text.split()
-    default_currency = get_user_currency(user_id)
+    
+    # Get selected wallet from context
+    wallet_id = context.user_data.get('outcome_wallet')
+    if not wallet_id:
+        await update.message.reply_text(
+            "Wallet not selected. Please start over.",
+            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+        return MAIN_MENU
+    
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT currency FROM wallets WHERE id = ?", (wallet_id,))
+        wallet_currency = cursor.fetchone()[0]
     
     try:
         # Parse currency if provided
@@ -1320,31 +1427,20 @@ async def add_outcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             description = ' '.join(text[2:]) if len(text) > 2 else "Expense"
         else:
             amount = float(text[0])
-            currency = default_currency
+            currency = wallet_currency
             description = ' '.join(text[1:]) if len(text) > 1 else "Expense"
         
         # Auto-detect category based on description
         category = detect_category(description)
         
+        # Convert amount to wallet currency if needed
+        if currency != wallet_currency:
+            converted_amount = convert_currency(amount, currency, wallet_currency)
+            amount = converted_amount
+            currency = wallet_currency
+        
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            
-            # Get default wallet
-            wallet_id = get_default_wallet(user_id)
-            if not wallet_id:
-                await update.message.reply_text(
-                    "❌ No default wallet set. Please create a wallet first.",
-                    reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
-                return MAIN_MENU
-                
-            cursor.execute("SELECT currency FROM wallets WHERE id = ?", (wallet_id,))
-            wallet_currency = cursor.fetchone()[0]
-            
-            # Convert amount to wallet currency if needed
-            if currency != wallet_currency:
-                converted_amount = convert_currency(amount, currency, wallet_currency)
-                amount = converted_amount
-                currency = wallet_currency
             
             # Get or create category
             cursor.execute(
@@ -1380,6 +1476,8 @@ async def add_outcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             f"👛 Wallet: {get_wallet_name(wallet_id)}",
             reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
         
+        # Clear temporary data
+        context.user_data.pop('outcome_wallet', None)
         return MAIN_MENU
 
     except (ValueError, IndexError):
@@ -1791,47 +1889,59 @@ async def show_recent_transactions(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    currency = get_user_currency(user_id)
     
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
             "SELECT * FROM transactions WHERE user_id = ? "
-            "ORDER BY date DESC LIMIT 5",
+            "ORDER BY date DESC",
             (user_id,)
         )
-        recent_transactions = cursor.fetchall()
+        transactions = cursor.fetchall()
 
-    if not recent_transactions:
+    if not transactions:
         await query.edit_message_caption(
-            caption="No recent transactions found!",
+            caption="No transactions found!",
             reply_markup=None
         )
         return MAIN_MENU
 
-    trans_text = "📜 *Recent Transactions*\n\n"
-    for t in recent_transactions:
-        date = format_transaction_date(t['date'])
+    # Format each transaction with proper styling
+    trans_text = "<b>📜 𝗧𝗿𝗮𝗻𝘀𝗮𝗰𝘁𝗶𝗼𝗻 𝗛𝗶𝘀𝘁𝗼𝗿𝘆</b>\n\n"
+    
+    for t in transactions:
+        date = format_transaction_date_long(t['date'])
         trans_type = "🟢 Income" if t['type'] == 'income' else "🔴 Expense"
-        amount = t['amount'] if t['amount'] > 0 else -t['amount']
-        trans_currency = t['currency'] if 'currency' in t.keys() else currency
-        description = t['description'][:20] + '...' if len(t['description']) > 20 else t['description']
+        amount = t['amount']
+        currency = t['currency']
+        wallet_name = get_wallet_name(t['wallet_id']) if t['wallet_id'] else "Unknown"
+        description = t['description']
+        
+        # Format amount with color
+        amount_str = format_money(abs(amount), currency)
+        if amount > 0:
+            amount_display = f"<b>+{amount_str}</b>"
+        else:
+            amount_display = f"<b>–{amount_str}</b>"
         
         trans_text += (
-            f"**{trans_type}**\n"
-            f"💸 Amount: {format_money(amount, trans_currency)}\n"
-            f"📅 Date: {date}\n"
+            f"<b>{date}</b>\n"
+            f"{trans_type} • {wallet_name}\n"
+            f"💸 Amount: {amount_display}\n"
             f"📝 {description}\n\n"
         )
     
-    # Add "Back to Summary" button
-    keyboard = [[InlineKeyboardButton("🔙 Back to Summary", callback_data="back_to_summary")]]
+    # Add pagination controls
+    keyboard = [
+        [InlineKeyboardButton("🔙 Back to Summary", callback_data="back_to_summary")],
+        [InlineKeyboardButton("🗑 Delete Transaction", callback_data="delete_transactions")]
+    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     # Edit the caption of the existing photo message
     await query.edit_message_caption(
         caption=trans_text,
-        parse_mode='Markdown',
+        parse_mode='HTML',
         reply_markup=reply_markup
     )
     
@@ -1901,6 +2011,14 @@ def main() -> None:
             MessageHandler(filters.Regex(r'^⚙️ Settings$'), settings_menu),
             CallbackQueryHandler(show_recent_transactions, pattern=r"^show_recent_trans$"),
             CallbackQueryHandler(back_to_summary, pattern=r"^back_to_summary$"),
+        ],
+        CHOOSE_WALLET_INCOME: [
+            CallbackQueryHandler(wallet_chosen_income, pattern=r"^income_wallet_"),
+            CallbackQueryHandler(start_over, pattern=r"^back_income"),
+        ],
+        CHOOSE_WALLET_OUTCOME: [
+            CallbackQueryHandler(wallet_chosen_outcome, pattern=r"^outcome_wallet_"),
+            CallbackQueryHandler(start_over, pattern=r"^back_outcome"),
         ],
         SETTINGS_MENU: [
             MessageHandler(filters.Regex(r'^💱 Currency$'), currency_menu),
