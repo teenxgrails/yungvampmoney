@@ -193,11 +193,42 @@ def format_money(amount, currency='USD'):
 def migrate_categories():
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        # Получить id категории 'Other'
-        cursor.execute("SELECT id FROM categories WHERE name = 'Other'")
-        other_id = cursor.fetchone()['id']
-        # Обновить старые транзакции, у которых нет категории
-        cursor.execute("UPDATE transactions SET category_id = ? WHERE category_id IS NULL", (other_id,))
+
+        # Создаем таблицу categories
+        cursor.execute('''CREATE TABLE IF NOT EXISTS categories
+                          (id INTEGER PRIMARY KEY, name TEXT UNIQUE)''')
+
+        # Заполняем стандартные категории
+        for category in CATEGORIES:
+            cursor.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (category,))
+        
+        # Добавляем колонку category_id, если её ещё нет
+        cursor.execute("PRAGMA table_info(transactions)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if 'category_id' not in columns:
+            cursor.execute("ALTER TABLE transactions ADD COLUMN category_id INTEGER")
+
+        conn.commit()
+
+
+def migrate_wallets():
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute('''CREATE TABLE IF NOT EXISTS wallets (
+                            id INTEGER PRIMARY KEY,
+                            user_id INTEGER,
+                            name TEXT,
+                            currency TEXT,
+                            balance REAL DEFAULT 0,
+                            is_default INTEGER DEFAULT 0)''')
+
+        # Добавляем колонку wallet_id, если её ещё нет
+        cursor.execute("PRAGMA table_info(transactions)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if 'wallet_id' not in columns:
+            cursor.execute("ALTER TABLE transactions ADD COLUMN wallet_id INTEGER")
+
         conn.commit()
 
 def create_default_wallets():
