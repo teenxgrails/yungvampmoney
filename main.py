@@ -190,70 +190,6 @@ def format_money(amount, currency='USD'):
     else:  # Default prefix
         return f"{symbol}{formatted_amount}"
 
-def migrate_categories():
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-
-        # Создаем таблицу categories
-        cursor.execute('''CREATE TABLE IF NOT EXISTS categories
-                          (id INTEGER PRIMARY KEY, name TEXT UNIQUE)''')
-
-        # Заполняем стандартные категории
-        for category in CATEGORIES:
-            cursor.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (category,))
-        
-        # Добавляем колонку category_id, если её ещё нет
-        cursor.execute("PRAGMA table_info(transactions)")
-        columns = [row[1] for row in cursor.fetchall()]
-        if 'category_id' not in columns:
-            cursor.execute("ALTER TABLE transactions ADD COLUMN category_id INTEGER")
-
-        conn.commit()
-
-
-def migrate_wallets():
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-
-        cursor.execute('''CREATE TABLE IF NOT EXISTS wallets (
-                            id INTEGER PRIMARY KEY,
-                            user_id INTEGER,
-                            name TEXT,
-                            currency TEXT,
-                            balance REAL DEFAULT 0,
-                            is_default INTEGER DEFAULT 0)''')
-
-        # Добавляем колонку wallet_id, если её ещё нет
-        cursor.execute("PRAGMA table_info(transactions)")
-        columns = [row[1] for row in cursor.fetchall()]
-        if 'wallet_id' not in columns:
-            cursor.execute("ALTER TABLE transactions ADD COLUMN wallet_id INTEGER")
-
-        conn.commit()
-
-def create_default_wallets():
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        # Получить всех уникальных пользователей
-        cursor.execute("SELECT DISTINCT user_id FROM transactions")
-        user_ids = [row['user_id'] for row in cursor.fetchall()]
-        for user_id in user_ids:
-            # Проверить, есть ли уже кошелёк
-            cursor.execute("SELECT id FROM wallets WHERE user_id = ?", (user_id,))
-            if not cursor.fetchone():
-                # Создать кошелёк
-                cursor.execute(
-                    "INSERT INTO wallets (user_id, name, currency, is_default) VALUES (?, ?, ?, ?)",
-                    (user_id, 'Main Wallet', 'USD', 1)
-                )
-                wallet_id = cursor.lastrowid
-                # Обновить транзакции этого пользователя
-                cursor.execute(
-                    "UPDATE transactions SET wallet_id = ? WHERE user_id = ? AND wallet_id IS NULL",
-                    (wallet_id, user_id)
-                )
-        conn.commit()
-
 def get_wallet_name(wallet_id):
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -768,7 +704,7 @@ async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         f"👛 <b>𝗪𝗮𝗹𝗹𝗲𝘁 𝗕𝗮𝗹𝗮𝗻𝗰𝗲𝘀</b>\n" + "\n".join(wallet_details) + "\n\n"
         
-        f"<b>💳 𝗧𝗼𝘁𝗮𝗹 𝗕𝗮𝗹𝗮𝗻𝗰𝗲:</b> {fm(total_balance):>16}\n\n"
+        f"<b>💳 𝗧𝗼𝘁𝗮𝗹 𝗕𝗮𝗹𝗮𝗻𝗰𝗲:</b> {fm(total_balance):>16}\n"
         #f"<b>🌍 𝗖𝘂𝗿𝗿𝗲𝗻𝗰𝘆:</b> {currency} {currency_symbol:>22}\n\n"
         
         "───────────────\n\n"
@@ -2060,9 +1996,6 @@ def main() -> None:
 
     # Start the Bot
     try:
-        init_db()
-        migrate_categories()
-        create_default_wallets()
         application.run_polling()
     except Exception as e:
         logger.error(f"Bot failed to start: {e}")
