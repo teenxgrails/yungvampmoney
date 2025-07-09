@@ -83,8 +83,17 @@ def init_db():
         if 'wallet_id' not in columns:
             cursor.execute("ALTER TABLE transactions ADD COLUMN wallet_id INTEGER")
             
+        # Create/modify holds table with wallet_id
         cursor.execute('''CREATE TABLE IF NOT EXISTS holds
-                     (id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL, description TEXT, currency TEXT)''')
+                     (id INTEGER PRIMARY KEY, 
+                      user_id INTEGER, 
+                      amount REAL, 
+                      description TEXT, 
+                      currency TEXT,
+                      wallet_id INTEGER,
+                      tags TEXT DEFAULT '',
+                      FOREIGN KEY(wallet_id) REFERENCES wallets(id))''')
+        
         cursor.execute('''CREATE TABLE IF NOT EXISTS recurring
                      (id INTEGER PRIMARY KEY, user_id INTEGER, type TEXT, amount REAL,
                      description TEXT, currency TEXT, day_of_month INTEGER,
@@ -100,7 +109,8 @@ def init_db():
 # --- Constants --- #
 MAIN_MENU, ADD_INCOME, ADD_OUTCOME, ADD_HOLD, MANAGE_HOLDS, \
 RECURRING_MENU, ADD_RECURRING, CURRENCY_MENU, MANAGE_TRANSACTIONS, \
-SET_BUDGET, REPORT_MENU, BACKUP, WALLET_MENU, ADD_WALLET, SETTINGS_MENU, CHOOSE_WALLET_INCOME, CHOOSE_WALLET_OUTCOME = range(17)
+SET_BUDGET, REPORT_MENU, BACKUP, WALLET_MENU, ADD_WALLET, SETTINGS_MENU, CHOOSE_WALLET_INCOME, CHOOSE_WALLET_OUTCOME, ADD_HOLD_FROM_WALLET, \
+CHOOSE_WALLET_FOR_HOLD, EDIT_HOLD, TRANSFER_AMOUNT, TRANSFER_TARGET = range(22)
 
 OXR_API_KEY = '390ab2a864c98873f38df1de'
 CURRENCY_API = f"https://open.er-api.com/v6/latest/USD?apikey={OXR_API_KEY}"
@@ -158,7 +168,7 @@ def format_transaction_date_long(db_date):
         dt = datetime.datetime.strptime(db_date, "%Y-%m-%d %H:%M:%S")
         return dt.strftime("%Y-%m-%d %H:%M")
     except:
-        return db_date
+        return db_date.split()[0] if db_date else "no date"
     
 def format_transaction_date(db_date):
     if not db_date:
@@ -271,6 +281,165 @@ async def set_budget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         reply_markup=InlineKeyboardMarkup(keyboard))
     return SET_BUDGET
 
+async def wallet_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    wallet_id = int(query.data.split('_')[1])
+    context.user_data['current_wallet'] = wallet_id
+    
+    with get_db_connection() as conn:
+        wallet = conn.execute("SELECT * FROM wallets WHERE id = ?", (wallet_id,)).fetchone()
+    
+    currency = wallet['currency']
+    balance = format_money(wallet['balance'], currency)
+    
+    await query.edit_message_text(
+        text=f"Wallet: {wallet['name']} ({currency})\n"
+             f"Balance: {balance}\n\n"
+             "Choose action:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💸 Transfer Funds", callback_data=f"transfer_from_{wallet_id}")],
+            [InlineKeyboardButton("⏳ Add Hold", callback_data=f"add_hold_{wallet_id}")],
+            [InlineKeyboardButton("🔙 Back to Wallets", callback_data="back_wallets")]
+        ]))
+    return WALLET_MENU
+
+async def add_hold_from_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    wallet_id = int(query.data.split('_')[2])
+    context.user_data['hold_wallet'] = wallet_id
+    
+    with get_db_connection() as conn:
+        wallet = conn.execute("SELECT * FROM wallets WHERE id = ?", (wallet_id,)).fetchone()
+    
+    await query.edit_message_text(
+        f"⏳ Adding hold from {wallet['name']}\n"
+        f"Available: {format_money(wallet['balance'], wallet['currency'])}\n\n"
+        "Enter amount to hold:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_wallet_actions")]])
+    )
+    return ADD_HOLD_FROM_WALLET
+
+async def process_hold_from_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.message.from_user.id
+    amount_text = update.message.text.replace(',', '.')  # Handle decimal separators
+    
+    try:
+        amount = float(amount_text)
+        if amount <= 0:
+            raise ValueError("Amount must be positive")
+            
+        wallet_id = context.user_data.get('hold_wallet')
+        if not wallet_id:
+            await update.message.reply_text(
+                "Wallet not selected. Please start over.",
+                reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+            return MAIN_MENU
+        
+        with get_db_connection() as conn:
+            # Get wallet details
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT balance, currency FROM wallets WHERE id = ? AND user_id = ?",
+                (wallet_id, user_id)
+            )
+            wallet = cursor.fetchone()
+            
+            if not wallet:
+                raise ValueError("Wallet not found")
+                
+            if amount > wallet['balance']:
+                raise ValueError(f"Insufficient funds. Available: {format_money(wallet['balance'], wallet['currency'])}")
+            
+            # Create hold with wallet_id
+            description = f"Hold from {get_wallet_name(wallet_id)}"
+            cursor.execute(
+                "INSERT INTO holds (user_id, amount, description, currency, wallet_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (user_id, amount, description, wallet['currency'], wallet_id)
+            )
+            
+            # Deduct from wallet
+            cursor.execute(
+                "UPDATE wallets SET balance = balance - ? WHERE id = ?",
+                (amount, wallet_id)
+            )
+            
+            conn.commit()
+            
+            await update.message.reply_text(
+                f"✅ Hold created: {format_money(amount, wallet['currency'])}\n"
+                f"From wallet: {get_wallet_name(wallet_id)}\n"
+                f"New balance: {format_money(wallet['balance'] - amount, wallet['currency'])}",
+                reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+            
+            # Clear context
+            context.user_data.pop('hold_wallet', None)
+            return MAIN_MENU
+            
+    except ValueError as e:
+        await update.message.reply_text(
+            f"❌ Error: {str(e)}\n\n"
+            "Please enter a valid amount:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_hold")]]))
+        return ADD_HOLD_FROM_WALLET
+    except Exception as e:
+        logger.error(f"Hold creation failed: {str(e)}")
+        await update.message.reply_text(
+            "❌ An error occurred. Please try again.",
+            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+        return MAIN_MENU
+
+async def wallets_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        # Get user from either message or callback query
+        if update.message:
+            user = update.message.from_user
+            reply_method = update.message.reply_text
+        elif update.callback_query:
+            user = update.callback_query.from_user
+            reply_method = update.callback_query.message.reply_text
+        else:
+            logger.error("Invalid update received in wallets_menu")
+            return MAIN_MENU
+
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM wallets WHERE user_id = ?", (user.id,))
+            wallets = cursor.fetchall()
+        
+        if not wallets:
+            text = "You don't have any wallets yet. Add your first wallet!"
+            keyboard = [['➕ Add Wallet'], ['🔙 Back']]
+        else:
+            text = "👛 Your Wallets:\n"
+            for wallet in wallets:
+                text += f"• {wallet['name']}: {format_money(wallet['balance'], wallet['currency'])}"
+                if wallet['is_default']:
+                    text += " (Default)"
+                text += "\n"
+            keyboard = [
+                ['➕ Add Wallet'],
+                ['🏷 Set Default Wallet'],
+                ['💸 Transfer Funds'],
+                ['🔙 Back']
+            ]
+        
+        await reply_method(
+            text,
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+        
+        return WALLET_MENU
+
+    except Exception as e:
+        logger.error(f"Error in wallets_menu: {str(e)}")
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "An error occurred. Returning to main menu.",
+                reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+        return MAIN_MENU
+
 async def budget_category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle budget category selection"""
     query = update.callback_query
@@ -344,7 +513,7 @@ async def generate_report(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """Generate financial reports"""
     keyboard = [[InlineKeyboardButton(rtype, callback_data=f"report_{rtype}")] 
                for rtype in REPORT_TYPES]
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back")])
+    #keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back")])
     
     await update.message.reply_text(
         "📈 Select report type:",
@@ -356,6 +525,10 @@ async def show_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     report_type = query.data.split('_')[1]
+    
+    if report_type == "back_to_reports":
+        return await settings_menu(update, context)
+        
     user_id = query.from_user.id
     now = datetime.datetime.now(TIMEZONE)
     currency = get_user_currency(user_id)
@@ -369,8 +542,14 @@ async def show_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💾 Savings: {format_money(summary['savings'], currency)}\n"
             f"💸 Savings Rate: {summary['income'] and int(summary['savings']/summary['income']*100) or 0}%"
         )
-        await query.edit_message_text(text)
-    
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data="back_to_reports")]
+            ])
+        )
+        return REPORT_MENU
+        
     elif report_type == "Category Breakdown":
         # Generate category spending breakdown
         with get_db_connection() as conn:
@@ -443,9 +622,10 @@ async def backup_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_document(
         document=BytesIO(json_data.encode()),
         filename=f"budget_backup_{datetime.date.today()}.json",
-        caption="Here's your financial data backup 📦"
+        caption="Here's your financial data backup 📦",
+        reply_markup=ReplyKeyboardMarkup(settings_keyboard, resize_keyboard=True)
     )
-    return MAIN_MENU
+    return SETTINGS_MENU
 
 async def notify_budget_updates(context: ContextTypes.DEFAULT_TYPE):
     """Send weekly budget updates to users"""
@@ -807,49 +987,26 @@ async def update_code1(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔️ You don't have permission to execute this command.")
         return
 
-    # Send initial response
-    msg = await update.message.reply_text("🔄 Updating code...")
-    
+    await update.message.reply_text("🔄 Updating code...")
+
     try:
-        # Change to your bot's directory
-        os.chdir("/root/bot")
-        
-        # Git pull
-        git_pull = subprocess.run(
+        git_result = subprocess.run(
             ["git", "pull"],
+            cwd="/root/bot",
             capture_output=True,
             text=True,
             check=True
         )
-        git_output = git_pull.stdout.strip()
-        
-        # Restart service
-        restart = subprocess.run(
-            ["sudo", "systemctl", "restart", "bot"],
-            capture_output=True,
-            text=True,
+
+        subprocess.run(
+            ["systemctl", "restart", "bot"],
             check=True
         )
-        
-        # Format success response
-        response = (
-            f"✅ <b>Update successful!</b>\n\n"
-            f"<b>Git output:</b>\n<code>{git_output}</code>\n\n"
-            f"<b>Service restart:</b>\n<code>Systemd restart completed</code>"
-        )
-        await msg.edit_text(response, parse_mode="HTML")
-        
+
+        await update.message.reply_text(f"✅ Done!\n\n<code>{git_result.stdout.strip()}</code>", parse_mode="HTML")
+
     except subprocess.CalledProcessError as e:
-        error_msg = (
-            f"❌ <b>Update failed!</b>\n\n"
-            f"<b>Command:</b> <code>{' '.join(e.cmd)}</code>\n"
-            f"<b>Exit code:</b> {e.returncode}\n"
-            f"<b>Error output:</b>\n<code>{e.stderr.strip()}</code>"
-        )
-        await msg.edit_text(error_msg, parse_mode="HTML")
-    except Exception as e:
-        logger.exception("Update error")
-        await msg.edit_text(f"❌ Unexpected error: {str(e)}")
+        await update.message.reply_text(f"❌ Error:\n<code>{e.stderr}</code>", parse_mode="HTML")
 
 async def wallets_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
@@ -948,22 +1105,15 @@ async def set_default_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return WALLET_MENU
 
 async def handle_set_default(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    
-    # Extract wallet ID from callback data
     try:
+        query = update.callback_query
+        await query.answer()
+        
         wallet_id = int(query.data.split('_')[1])
-    except (IndexError, ValueError):
-        logger.error(f"Invalid callback data: {query.data}")
-        await query.edit_message_text("❌ Invalid wallet selection")
-        return await wallets_menu(update, context)
-    
-    user_id = query.from_user.id
-    
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        try:
+        user_id = query.from_user.id
+        
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
             # Clear previous default
             cursor.execute(
                 "UPDATE wallets SET is_default = 0 WHERE user_id = ?",
@@ -986,17 +1136,32 @@ async def handle_set_default(update: Update, context: ContextTypes.DEFAULT_TYPE)
             
             conn.commit()
             
+            # Create a new inline keyboard with just a "Back" button
+            keyboard = InlineKeyboardMarkup([
+                #[InlineKeyboardButton("🔙 Back to Wallets", callback_data="back_wallets")]
+            ])
+            
             await query.edit_message_text(
                 f"✅ Default wallet set to: {wallet['name']} ({wallet['currency']})",
-                reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+                reply_markup=keyboard)
             
-        except sqlite3.Error as e:
-            conn.rollback()
-            logger.error(f"Database error setting default wallet: {e}")
-            await query.edit_message_text("❌ Error updating wallet")
-            return await wallets_menu(update, context)
-    
-    return await wallets_menu(update, context)
+            return WALLET_MENU
+            
+    except (IndexError, ValueError) as e:
+        logger.error(f"Invalid callback data: {str(e)}")
+        if update.callback_query:
+            await update.callback_query.edit_message_text("❌ Invalid wallet selection")
+        return await wallets_menu(update, context)
+    except sqlite3.Error as e:
+        logger.error(f"Database error setting default wallet: {str(e)}")
+        if update.callback_query:
+            await update.callback_query.edit_message_text("❌ Error updating wallet")
+        return await wallets_menu(update, context)
+    except Exception as e:
+        logger.error(f"Unexpected error in handle_set_default: {str(e)}")
+        if update.callback_query:
+            await update.callback_query.edit_message_text("❌ An error occurred")
+        return await wallets_menu(update, context)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.message.from_user
@@ -1487,71 +1652,162 @@ async def add_outcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return ADD_OUTCOME
 
 async def holds_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        if not update.effective_message or not update.effective_user:
+            logger.error("Invalid update received in holds_menu")
+            return MAIN_MENU
+
+        user_id = update.effective_user.id
+        
+        with get_db_connection() as conn:
+            holds = conn.execute("SELECT * FROM holds WHERE user_id = ?", (user_id,)).fetchall()
+
+        if not holds:
+            text = "No holds found! How would you like to add a hold?"
+            keyboard = [
+                ['➕ Normal Hold', '➕ From Wallet'],
+                ['🔙 Back']
+            ]
+        else:
+            # Fix: Use dictionary access with fallback instead of .get()
+            holds_list = "\n".join(
+                f"{idx+1}. {(hold['tags'] + ' ') if 'tags' in hold and hold['tags'] else ''}{hold['description']}: {format_money(hold['amount'], hold['currency'])}" 
+                for idx, hold in enumerate(holds)
+            )
+            text = f"⏳ Your holds:\n{holds_list}\n\nSelect how to add:"
+            keyboard = [
+                ['➕ Normal Hold', '➕ From Wallet'],
+                ['🛠 Manage Hold'],
+                ['🔙 Back']
+            ]
+        
+        await update.effective_message.reply_text(
+            text,
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+        
+        return MANAGE_HOLDS
+
+    except Exception as e:
+        logger.error(f"Error in holds_menu: {str(e)}")
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "An error occurred. Returning to main menu.",
+                reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+        return MAIN_MENU
+
+async def choose_wallet_for_hold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
-    currency = get_user_currency(user_id)
     
     with get_db_connection() as conn:
-        holds = conn.execute("SELECT * FROM holds WHERE user_id = ?", (user_id,)).fetchall()
-
-    if not holds:
-        text = f"No holds found! Add a new hold (currency: {currency}):"
-        keyboard = [['➕ Add Hold'], ['🔙 Back']]
-    else:
-        holds_list = "\n".join(
-            f"{idx+1}. {format_money(hold['amount'], hold['currency'])} - {hold['description']}" 
-            for idx, hold in enumerate(holds)
-        )
-        text = f"⏳ Your holds:\n{holds_list}\n\nSelect an action:"
-        keyboard = [['➕ Add Hold'], ['🛠 Manage Hold'], ['🔙 Back']]
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, currency, balance FROM wallets WHERE user_id = ?", (user_id,))
+        wallets = cursor.fetchall()
+    
+    if not wallets:
+        await update.message.reply_text(
+            "No wallets available. Add a wallet first!",
+            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+        return MAIN_MENU
+    
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{wallet['name']} ({format_money(wallet['balance'], wallet['currency'])})", 
+            callback_data=f"hold_wallet_{wallet['id']}"
+        )]
+        for wallet in wallets
+    ]
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_holds")])
     
     await update.message.reply_text(
-        text,
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+        "👛 Select wallet to hold from:",
+        reply_markup=InlineKeyboardMarkup(keyboard))
+    return CHOOSE_WALLET_FOR_HOLD
+
+async def wallet_chosen_for_hold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    wallet_id = int(query.data.split('_')[2])
+    context.user_data['hold_wallet'] = wallet_id
     
-    # Return the correct state based on the menu we're showing
-    if not holds:
-        return ADD_HOLD
-    return MANAGE_HOLDS
+    with get_db_connection() as conn:
+        wallet = conn.execute("SELECT * FROM wallets WHERE id = ?", (wallet_id,)).fetchone()
+    
+    await query.edit_message_text(
+        f"⏳ Adding hold from {wallet['name']}\n"
+        f"Available: {format_money(wallet['balance'], wallet['currency'])}\n\n"
+        "Enter amount to hold:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_choose_wallet_hold")]])
+    )
+    return ADD_HOLD_FROM_WALLET
+
 
 async def add_hold_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
     currency = get_user_currency(user_id)
     await update.message.reply_text(
-        f"⏳ Add hold in format (currency: {currency}):\n"
-        "<b>Amount</b> (e.g., 1000)\n"
-        "OR\n"
-        "<b>Amount Description</b> (e.g., 1000 Amazon)",
+        f"⏳ Add holds (one per line) in format (currency: {currency}):\n"
+        "<b>Amount Description</b>\n"
+        "Example:\n"
+        "1000 Amazon purchase\n"
+        "2000 Groceries\n"
+        "500 Restaurant bill\n\n"
+        "You can add multiple holds at once by putting each on a new line",
         reply_markup=ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True),
         parse_mode="HTML")
     return ADD_HOLD
 
 async def add_hold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
-    text = update.message.text.split()
+    text = update.message.text
     currency = get_user_currency(user_id)
+    success_count = 0
+    error_messages = []
 
-    try:
-        amount = float(text[0])
-        description = ' '.join(text[1:]) if len(text) > 1 else "Hold"
+    # Split input by lines
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        for line in lines:
+            try:
+                # Split each line into amount and description
+                parts = line.split(maxsplit=1)
+                if len(parts) < 1:
+                    error_messages.append(f"❌ Invalid format in line: '{line}'")
+                    continue
+                
+                amount = float(parts[0])
+                description = parts[1] if len(parts) > 1 else "Hold"
+                
+                cursor.execute(
+                    "INSERT INTO holds (user_id, amount, description, currency) VALUES (?, ?, ?, ?)",
+                    (user_id, amount, description, currency)
+                )
+                success_count += 1
+                
+            except ValueError:
+                error_messages.append(f"❌ Invalid amount in line: '{line}'")
+            except Exception as e:
+                error_messages.append(f"❌ Error processing line: '{line}'")
+                logger.error(f"Error adding hold: {str(e)}")
+        
+        conn.commit()
 
-        with get_db_connection() as conn:
-            conn.execute(
-                "INSERT INTO holds (user_id, amount, description, currency) VALUES (?, ?, ?, ?)",
-                (user_id, amount, description, currency)
-            )
-            conn.commit()
+    # Prepare response message
+    response = []
+    if success_count > 0:
+        response.append(f"✅ Added {success_count} hold(s) successfully!")
+    if error_messages:
+        response.append("\n".join(error_messages))
+    
+    if not response:  # If somehow nothing was processed
+        response.append("No valid holds were processed")
 
-        await update.message.reply_text(
-            f"✅ Hold added: {format_money(amount, currency)} - {description}",
-            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
-        return MAIN_MENU
-
-    except (ValueError, IndexError):
-        await update.message.reply_text(
-            "❌ Invalid format. Please enter amount and optional description\n"
-            "Example: 500 Vacation savings",
-            reply_markup=ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True))
-        return ADD_HOLD
+    await update.message.reply_text(
+        "\n".join(response),
+        reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+    return MAIN_MENU
 
 async def transfer_funds_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Prompt user to select source wallet for transfer"""
@@ -1587,76 +1843,110 @@ async def select_target_wallet(update: Update, context: ContextTypes.DEFAULT_TYP
     """Handle source wallet selection and prompt for target wallet"""
     query = update.callback_query
     await query.answer()
-    source_wallet_id = int(query.data.split('_')[2])
-    context.user_data['transfer'] = {'from': source_wallet_id}
     
-    user_id = query.from_user.id
-    
-    with get_db_connection() as conn:
-        # Get source wallet details
-        source_wallet = conn.execute(
-            "SELECT * FROM wallets WHERE id = ?", 
-            (source_wallet_id,)
-        ).fetchone()
+    try:
+        source_wallet_id = int(query.data.split('_')[2])
+        user_id = query.from_user.id
         
-        # Get available target wallets (excluding source)
-        target_wallets = conn.execute(
-            "SELECT * FROM wallets WHERE user_id = ? AND id != ?",
-            (user_id, source_wallet_id)
-        ).fetchall()
+        with get_db_connection() as conn:
+            # Get source wallet details
+            source_wallet = conn.execute(
+                "SELECT name, currency, balance FROM wallets WHERE id = ?", 
+                (source_wallet_id,)
+            ).fetchone()
+            
+            if not source_wallet:
+                await query.edit_message_text("Source wallet not found!")
+                return WALLET_MENU
+                
+            # Initialize transfer data with all required fields
+            context.user_data['transfer'] = {
+                'from': source_wallet_id,
+                'from_currency': source_wallet['currency'],
+                'from_balance': source_wallet['balance'],
+                'from_name': source_wallet['name']
+            }
+            
+            # Get available target wallets (excluding source)
+            target_wallets = conn.execute(
+                "SELECT id, name, currency FROM wallets WHERE user_id = ? AND id != ?",
+                (user_id, source_wallet_id)
+            ).fetchall()
 
-    keyboard = [
-        [InlineKeyboardButton(
-            f"{wallet['name']} ({wallet['currency']})", 
-            callback_data=f"transfer_to_{wallet['id']}"
-        )]
-        for wallet in target_wallets
-    ]
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_transfer")])
+        if not target_wallets:
+            await query.edit_message_text("No other wallets available for transfer!")
+            return WALLET_MENU
 
-    await query.edit_message_text(
-        f"Transferring from: {source_wallet['name']} ({source_wallet['currency']})\n"
-        "Select target wallet:",
-        reply_markup=InlineKeyboardMarkup(keyboard))
-    return WALLET_MENU
+        keyboard = [
+            [InlineKeyboardButton(
+                f"{wallet['name']} ({wallet['currency']})", 
+                callback_data=f"transfer_to_{wallet['id']}"
+            )]
+            for wallet in target_wallets
+        ]
+        keyboard.append([InlineKeyboardButton("🔙 Cancel", callback_data="cancel_transfer")])
+
+        await query.edit_message_text(
+            f"Transferring from: {source_wallet['name']} ({source_wallet['currency']})\n"
+            "Select target wallet:",
+            reply_markup=InlineKeyboardMarkup(keyboard))
+            
+        return TRANSFER_TARGET
+
+    except Exception as e:
+        logger.error(f"Error in select_target_wallet: {str(e)}")
+        await query.edit_message_text(
+            "An error occurred. Please try again.",
+            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+        return MAIN_MENU
 
 async def enter_transfer_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle target wallet selection and prompt for amount"""
     query = update.callback_query
     await query.answer()
-    target_wallet_id = int(query.data.split('_')[2])
-    context.user_data['transfer']['to'] = target_wallet_id
     
-    with get_db_connection() as conn:
-        # Get wallet details
-        source_wallet = conn.execute(
-            "SELECT * FROM wallets WHERE id = ?",
-            (context.user_data['transfer']['from'],)
-        ).fetchone()
+    try:
+        target_wallet_id = int(query.data.split('_')[2])
+        user_id = query.from_user.id
         
-        target_wallet = conn.execute(
-            "SELECT * FROM wallets WHERE id = ?",
-            (target_wallet_id,)
-        ).fetchone()
+        with get_db_connection() as conn:
+            # Get target wallet details
+            target_wallet = conn.execute(
+                "SELECT name, currency FROM wallets WHERE id = ?", 
+                (target_wallet_id,)
+            ).fetchone()
+            
+            if not target_wallet:
+                await query.edit_message_text("Target wallet not found!")
+                return WALLET_MENU
+                
+            # Update transfer data with target info
+            context.user_data['transfer'].update({
+                'to': target_wallet_id,
+                'to_currency': target_wallet['currency'],
+                'to_name': target_wallet['name']
+            })
 
-    context.user_data['transfer']['from_currency'] = source_wallet['currency']
-    context.user_data['transfer']['to_currency'] = target_wallet['currency']
-    
-    # Edit the message to prompt for amount
-    await query.edit_message_text(
-        f"💸 Transfer from {source_wallet['name']} ({source_wallet['currency']}) "
-        f"to {target_wallet['name']} ({target_wallet['currency']})\n\n"
-        f"Available: {format_money(source_wallet['balance'], source_wallet['currency'])}\n"
-        "Enter amount to transfer:",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_transfer")]]))
-    
-    # Return the state that will process the amount input
-    return WALLET_MENU
+        await query.edit_message_text(
+            f"💸 Transfer from {context.user_data['transfer']['from_name']} ({context.user_data['transfer']['from_currency']}) "
+            f"to {target_wallet['name']} ({target_wallet['currency']})\n\n"
+            f"Available: {format_money(context.user_data['transfer']['from_balance'], context.user_data['transfer']['from_currency'])}\n"
+            "Enter amount to transfer:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_transfer")]])
+        )
+        return TRANSFER_AMOUNT
+
+    except Exception as e:
+        logger.error(f"Error in enter_transfer_amount: {str(e)}")
+        await query.edit_message_text(
+            "An error occurred. Please try again.",
+            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+        return MAIN_MENU
 
 async def process_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Process the wallet-to-wallet transfer"""
     user_id = update.message.from_user.id
-    amount_text = update.message.text.replace(',', '.')  # Handle both decimal separators
+    amount_text = update.message.text.replace(',', '.')
     
     try:
         amount = float(amount_text)
@@ -1751,6 +2041,13 @@ async def process_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             context.user_data.pop('transfer', None)
             
             return MAIN_MENU
+        
+    except ValueError as e:
+        await update.message.reply_text(
+            f"❌ Error: {str(e)}\n\n"
+            "Please enter a valid amount to transfer:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_transfer")]]))
+        return TRANSFER_AMOUNT  # Stay in transfer amount state
             
     except ValueError as e:
         await update.message.reply_text(
@@ -1771,36 +2068,54 @@ async def cancel_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
     
     context.user_data.pop('transfer', None)
+    # Use inline keyboard for edited message
     await query.edit_message_text(
         "Transfer cancelled",
-        reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
-    return MAIN_MENU
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Back to Wallets", callback_data="back_wallets")]
+        ])
+    )
+    return WALLET_MENU
 
 async def manage_hold_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.message.from_user.id
-    
-    with get_db_connection() as conn:
-        holds = conn.execute("SELECT * FROM holds WHERE user_id = ?", (user_id,)).fetchall()
+    try:
+        if not update.effective_message or not update.effective_user:
+            logger.error("Invalid update received in manage_hold_menu")
+            return MAIN_MENU
 
-    if not holds:
-        await update.message.reply_text(
-            "No holds available!",
-            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+        user_id = update.effective_user.id
+        
+        with get_db_connection() as conn:
+            holds = conn.execute("SELECT * FROM holds WHERE user_id = ?", (user_id,)).fetchall()
+
+        if not holds:
+            await update.effective_message.reply_text(
+                "No holds available!",
+                reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+            return MAIN_MENU
+
+        # Fix: Use direct dictionary-style access with existence check
+        keyboard = [
+            [InlineKeyboardButton(
+                f"{(hold['tags'] + ' ') if 'tags' in hold and hold['tags'] else ''}{hold['description']}: {format_money(hold['amount'], hold['currency'])}", 
+                callback_data=f"hold_{hold['id']}"
+            )] 
+            for hold in holds
+        ]
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_holds")])
+
+        await update.effective_message.reply_text(
+            "Select a hold to manage:",
+            reply_markup=InlineKeyboardMarkup(keyboard))
+        return MANAGE_HOLDS
+
+    except Exception as e:
+        logger.error(f"Error in manage_hold_menu: {str(e)}")
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "An error occurred. Returning to main menu.",
+                reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
         return MAIN_MENU
-
-    keyboard = [
-        [InlineKeyboardButton(
-            f"{format_money(hold['amount'], hold['currency'])} - {hold['description']}", 
-            callback_data=f"hold_{hold['id']}"
-        )] 
-        for hold in holds
-    ]
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_holds")])
-
-    await update.message.reply_text(
-        "Select a hold to manage:",
-        reply_markup=InlineKeyboardMarkup(keyboard))
-    return MANAGE_HOLDS
 
 async def hold_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -1810,18 +2125,136 @@ async def hold_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
     with get_db_connection() as conn:
         hold = conn.execute("SELECT * FROM holds WHERE id = ?", (hold_id,)).fetchone()
+        if not hold:
+            await query.edit_message_text("Hold not found!")
+            return MAIN_MENU
 
-    currency = hold['currency']
+    # Convert Row to dict for easier access
+    hold_dict = dict(hold)
+    currency = hold_dict['currency']
+    tags = hold_dict.get('tags', '') or ''  # Handle case where tags might be None
     
     await query.edit_message_text(
-        text=f"Hold selected: {format_money(hold['amount'], currency)} - {hold['description']}\nChoose action:",
+        text=f"📌 Hold: {format_money(hold_dict['amount'], currency)}\n"
+             f"📝 Description: {tags}{hold_dict['description']}\n\n"
+             "Choose action:",
         reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Rename", callback_data=f"rename_{hold_id}"),
+             InlineKeyboardButton("🏷 Add Tag", callback_data=f"tag_{hold_id}")],
             [InlineKeyboardButton("➡️ To Income", callback_data=f"transfer_income_{hold_id}"),
              InlineKeyboardButton("⬅️ To Expense", callback_data=f"transfer_outcome_{hold_id}")],
             [InlineKeyboardButton("❌ Remove", callback_data=f"remove_{hold_id}")],
             [InlineKeyboardButton("🔙 Back", callback_data="back_holds")]
         ]))
     return MANAGE_HOLDS
+
+async def rename_hold_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    hold_id = int(query.data.split('_')[1])
+    context.user_data['editing_hold'] = hold_id
+
+    with get_db_connection() as conn:
+        hold = conn.execute("SELECT * FROM holds WHERE id = ?", (hold_id,)).fetchone()
+        if not hold:
+            await query.edit_message_text("Hold not found!")
+            return MAIN_MENU
+        hold_dict = dict(hold)
+
+    await query.edit_message_text(
+        f"✏️ Editing hold: {format_money(hold_dict['amount'], hold_dict['currency'])}\n"
+        f"Current description: {hold_dict.get('tags', '') or ''}{hold_dict['description']}\n\n"
+        "Enter new description:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data=f"hold_{hold_id}")]])
+    )
+    return EDIT_HOLD
+
+async def add_tag_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    hold_id = int(query.data.split('_')[1])
+    context.user_data['tagging_hold'] = hold_id
+
+    keyboard = [
+        [InlineKeyboardButton("🟢 REFUND", callback_data=f"addtag_{hold_id}_🟢 REFUND")],
+        [InlineKeyboardButton("❗️SELL", callback_data=f"addtag_{hold_id}_❗️SELL")],
+        [InlineKeyboardButton("💳 PAYMENT", callback_data=f"addtag_{hold_id}_💳 PAYMENT")],
+        [InlineKeyboardButton("📦 ORDER", callback_data=f"addtag_{hold_id}_📦 ORDER")],
+        [InlineKeyboardButton("🔙 Back", callback_data=f"hold_{hold_id}")]
+    ]
+
+    await query.edit_message_text(
+        "Select a tag to add:",
+        reply_markup=InlineKeyboardMarkup(keyboard))
+    return MANAGE_HOLDS
+
+async def apply_tag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    _, hold_id, tag = query.data.split('_', 2)
+    hold_id = int(hold_id)
+
+    with get_db_connection() as conn:
+        # Get current tags
+        cursor = conn.cursor()
+        cursor.execute("SELECT tags FROM holds WHERE id = ?", (hold_id,))
+        result = cursor.fetchone()
+        current_tags = result[0] if result and result[0] else ""
+        
+        # Add new tag if not already present
+        if f"[{tag}]" not in current_tags:
+            new_tags = f"{current_tags} [{tag}]" if current_tags else f"[{tag}]"
+            cursor.execute(
+                "UPDATE holds SET tags = ? WHERE id = ?",
+                (new_tags, hold_id)
+            )
+            conn.commit()
+
+            # Get the updated hold to show in message
+            cursor.execute("SELECT description FROM holds WHERE id = ?", (hold_id,))
+            description = cursor.fetchone()[0] or ""
+            
+            await query.edit_message_text(
+                f"✅ Tag added: [{tag}]\nNew description: {new_tags}{description}",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"hold_{hold_id}")]])
+            )
+        else:
+            await query.edit_message_text(
+                f"ℹ️ Tag [{tag}] already exists",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"hold_{hold_id}")]]))
+    return MANAGE_HOLDS
+
+async def save_hold_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.message.from_user.id
+    new_description = update.message.text
+    hold_id = context.user_data.get('editing_hold')
+
+    if not hold_id:
+        await update.message.reply_text(
+            "Hold not found. Please start over.",
+            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+        return MAIN_MENU
+
+    with get_db_connection() as conn:
+        # Get current tags to preserve them
+        cursor = conn.cursor()
+        cursor.execute("SELECT tags FROM holds WHERE id = ?", (hold_id,))
+        result = cursor.fetchone()
+        tags = result[0] if result and result[0] else ""
+
+        # Update description but keep tags
+        cursor.execute(
+            "UPDATE holds SET description = ? WHERE id = ? AND user_id = ?",
+            (new_description, hold_id, user_id)
+        )
+        conn.commit()
+
+    await update.message.reply_text(
+        f"✅ Hold description updated!\nNew description: {tags}{new_description}",
+        reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+    
+    context.user_data.pop('editing_hold', None)
+    return MAIN_MENU
 
 async def transfer_hold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -1831,17 +2264,31 @@ async def transfer_hold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     with get_db_connection() as conn:
         hold = conn.execute("SELECT * FROM holds WHERE id = ?", (hold_id,)).fetchone()
+        if not hold:
+            await query.edit_message_text("Hold not found!")
+            return MAIN_MENU
+            
         currency = hold['currency']
+        wallet_id = hold.get('wallet_id')
         
         # Create transaction
         trans_type = 'income' if action == 'income' else 'outcome'
         amount = hold['amount'] if action == 'income' else -hold['amount']
         description = f"{'Released' if action == 'income' else 'Spent'} hold: {hold['description']}"
         
+        # If hold was from a wallet, return funds when transferring to expense
+        if wallet_id and action == 'outcome':
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE wallets SET balance = balance + ? WHERE id = ?",
+                (hold['amount'], wallet_id)
+            )
+        
+        # Insert transaction
         conn.execute(
-            "INSERT INTO transactions (user_id, type, amount, description, date, currency) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, trans_type, amount, description, get_current_datetime(), currency)
+            "INSERT INTO transactions (user_id, type, amount, description, date, currency, wallet_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, trans_type, amount, description, get_current_datetime(), currency, wallet_id)
         )
         
         # Remove hold
@@ -1874,10 +2321,29 @@ async def start_over(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return MAIN_MENU
 
 async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text(
-        "⚙️ Settings Menu",
-        reply_markup=ReplyKeyboardMarkup(settings_keyboard, resize_keyboard=True))
-    return SETTINGS_MENU
+    try:
+        # Handle both Message and CallbackQuery updates
+        if update.message:
+            reply_method = update.message.reply_text
+        elif update.callback_query:
+            await update.callback_query.answer()
+            reply_method = update.callback_query.message.reply_text
+        else:
+            logger.error("Invalid update received in settings_menu")
+            return MAIN_MENU
+
+        await reply_method(
+            "⚙️ Settings Menu",
+            reply_markup=ReplyKeyboardMarkup(settings_keyboard, resize_keyboard=True))
+        return SETTINGS_MENU
+
+    except Exception as e:
+        logger.error(f"Error in settings_menu: {str(e)}")
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "An error occurred. Returning to main menu.",
+                reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+        return MAIN_MENU
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
@@ -1934,7 +2400,7 @@ async def show_recent_transactions(update: Update, context: ContextTypes.DEFAULT
     # Add pagination controls
     keyboard = [
         [InlineKeyboardButton("🔙 Back to Summary", callback_data="back_to_summary")],
-        [InlineKeyboardButton("🗑 Delete Transaction", callback_data="delete_transactions")]
+        #[InlineKeyboardButton("🗑 Delete Transaction", callback_data="delete_transactions")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -1962,12 +2428,25 @@ async def back_to_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Log errors caused by updates."""
-    logger.error('Update "%s" caused error "%s"', update, context.error)
-    if update.effective_message:
-        await update.effective_message.reply_text(
-            "An error occurred. Please try again.",
-            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
-        )
+    try:
+        logger.error('Update "%s" caused error "%s"', update, context.error, exc_info=context.error)
+        
+        if update.callback_query:
+            try:
+                await update.callback_query.answer()
+                await update.callback_query.message.reply_text(
+                    "An error occurred. Please try again.",
+                    reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
+                )
+            except Exception as e:
+                logger.error(f"Error handling callback error: {str(e)}")
+        elif update.message:
+            await update.message.reply_text(
+                "An error occurred. Please try again.",
+                reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
+            )
+    except Exception as e:
+        logger.error(f"Error in error handler: {str(e)}")
 
 def main() -> None:
     # Initialize database
@@ -2031,17 +2510,23 @@ def main() -> None:
             MessageHandler(filters.Regex(r'^🔙 Back$'), start_over),
             ],
             WALLET_MENU: [
-                MessageHandler(filters.Regex(r'^➕ Add Wallet$'), add_wallet_prompt),
-                MessageHandler(filters.Regex(r'^🏷 Set Default Wallet$'), set_default_wallet),
-                MessageHandler(filters.Regex(r'^💸 Transfer Funds$'), transfer_funds_prompt),
-                MessageHandler(filters.Regex(r'^🔙 Back$'), start_over),
-                CallbackQueryHandler(handle_set_default, pattern=r"^setdef_"),
-                CallbackQueryHandler(select_target_wallet, pattern=r"^transfer_from_"),
-                CallbackQueryHandler(enter_transfer_amount, pattern=r"^transfer_to_"),
-                CallbackQueryHandler(cancel_transfer, pattern=r"^cancel_transfer$"),
-                CallbackQueryHandler(transfer_funds_prompt, pattern=r"^back_transfer$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, process_transfer)
+    MessageHandler(filters.Regex(r'^💸 Transfer Funds$'), transfer_funds_prompt),
+    MessageHandler(filters.Regex(r'^➕ Add Wallet$'), add_wallet_prompt),
+    MessageHandler(filters.Regex(r'^🏷 Set Default Wallet$'), set_default_wallet),
+    MessageHandler(filters.Regex(r'^🔙 Back$'), start_over),
+    CallbackQueryHandler(handle_set_default, pattern=r"^setdef_"),
+    CallbackQueryHandler(wallets_menu, pattern=r"^back_wallets$"),
+    CallbackQueryHandler(wallet_actions, pattern=r"^wallet_"),
+    CallbackQueryHandler(select_target_wallet, pattern=r"^transfer_from_"),
+        ],
+        ADD_HOLD_FROM_WALLET: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, process_hold_from_wallet),
+            CallbackQueryHandler(wallet_actions, pattern=r"^back_wallet_actions$"),
             ],
+            TRANSFER_TARGET: [
+    CallbackQueryHandler(enter_transfer_amount, pattern=r"^transfer_to_"),
+    CallbackQueryHandler(cancel_transfer, pattern=r"^cancel_transfer$"),
+],
             ADD_WALLET: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_wallet),
                 MessageHandler(filters.Regex(r'^❌ Cancel$'), cancel)
@@ -2078,19 +2563,35 @@ def main() -> None:
                 CallbackQueryHandler(set_currency, pattern=r"^currency_"),
                 CallbackQueryHandler(start_over, pattern=r"^back_currency")
             ],
+            TRANSFER_AMOUNT: [
+    MessageHandler(filters.TEXT & ~filters.COMMAND, process_transfer),
+    CallbackQueryHandler(cancel_transfer, pattern=r"^cancel_transfer$"),
+],
             MANAGE_HOLDS: [
-                MessageHandler(filters.Regex(r'^➕ Add Hold$'), add_hold_prompt),
+                
+                    MessageHandler(filters.Regex(r'^➕ Normal Hold$'), add_hold_prompt),
+    MessageHandler(filters.Regex(r'^➕ From Wallet$'), choose_wallet_for_hold),
     MessageHandler(filters.Regex(r'^🛠 Manage Hold$'), manage_hold_menu),
     MessageHandler(filters.Regex(r'^🔙 Back$'), start_over),
     CallbackQueryHandler(hold_action, pattern=r"^hold_"),
     CallbackQueryHandler(transfer_hold, pattern=r"^transfer_(income|outcome)_"),
     CallbackQueryHandler(remove_hold, pattern=r"^remove_"),
     CallbackQueryHandler(start_over, pattern=r"^back_holds"),
-                CallbackQueryHandler(hold_action, pattern=r"^hold_"),
-                CallbackQueryHandler(transfer_hold, pattern=r"^transfer_(income|outcome)_"),
-                CallbackQueryHandler(remove_hold, pattern=r"^remove_"),
-                CallbackQueryHandler(start_over, pattern=r"^back_holds")
+    # Add new callback handlers
+    CallbackQueryHandler(wallet_chosen_for_hold, pattern=r"^hold_wallet_"),
+    CallbackQueryHandler(holds_menu, pattern=r"^back_choose_wallet_hold$"),
+    CallbackQueryHandler(rename_hold_prompt, pattern=r"^rename_\d+$"),
+        CallbackQueryHandler(add_tag_prompt, pattern=r"^tag_\d+$"),
+        CallbackQueryHandler(apply_tag, pattern=r"^addtag_\d+_.+$"),
             ],
+            EDIT_HOLD: [
+        MessageHandler(filters.TEXT & ~filters.COMMAND, save_hold_name),
+        CallbackQueryHandler(hold_action, pattern=r"^hold_\d+$")
+    ],
+            CHOOSE_WALLET_FOR_HOLD: [
+    CallbackQueryHandler(wallet_chosen_for_hold, pattern=r"^hold_wallet_"),
+    CallbackQueryHandler(holds_menu, pattern=r"^back_holds$"),
+],
             MANAGE_TRANSACTIONS: [
                 CallbackQueryHandler(delete_transaction, pattern=r"^del_trans_"),
                 CallbackQueryHandler(start_over, pattern=r"^back_transactions")
@@ -2101,9 +2602,10 @@ def main() -> None:
                 CallbackQueryHandler(start_over, pattern=r"^cancel_budget$"),
             ],
             REPORT_MENU: [
-                CallbackQueryHandler(show_report, pattern=r"^report_"),
-                MessageHandler(filters.Regex(r'^🔙 Back$'), start_over)
-            ]
+    CallbackQueryHandler(show_report, pattern=r"^report_"),
+    CallbackQueryHandler(settings_menu, pattern=r"^back_to_reports$"),
+    MessageHandler(filters.Regex(r'^🔙 Back$'), start_over)
+],
         },
         fallbacks=[CommandHandler('start', start)],
         allow_reentry=True
