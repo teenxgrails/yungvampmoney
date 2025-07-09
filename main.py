@@ -2530,7 +2530,7 @@ def main() -> None:
 
     # Create application with job queue
     try:
-        TOKEN = os.getenv("TELEGRAM_TOKEN", "7847351145:AAEgUwSdwpYoLANB06PumVfTeQEH-I85EbM")
+        TOKEN = os.getenv("TELEGRAM_TOKEN", "8017763140:AAHD8fI9orJbnIyljuWF8PZN6yBmDxKuPrw")
         application = Application.builder().token(TOKEN).build()
     except Exception as e:
         logger.error(f"Failed to create application: {e}")
