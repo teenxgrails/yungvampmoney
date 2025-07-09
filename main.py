@@ -719,13 +719,50 @@ async def delete_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     trans_id = int(query.data.split('_')[2])
+    user_id = query.from_user.id
 
     with get_db_connection() as conn:
-        conn.execute("DELETE FROM transactions WHERE id = ?", (trans_id,))
-        conn.commit()
+        try:
+            # Get transaction details before deleting
+            cursor = conn.cursor()
+            trans = cursor.execute(
+                "SELECT type, amount, wallet_id, currency FROM transactions WHERE id = ? AND user_id = ?",
+                (trans_id, user_id)
+            ).fetchone()
 
-    await query.edit_message_text("✅ Transaction deleted successfully!")
-    return await show_balance_menu(update, context)
+            if not trans:
+                await query.edit_message_text("❌ Transaction not found!")
+                return await show_transactions_for_deletion(update, context)
+
+            # Delete the transaction
+            cursor.execute("DELETE FROM transactions WHERE id = ?", (trans_id,))
+            
+            # Update wallet balance
+            if trans['wallet_id']:
+                adjustment = -trans['amount'] if trans['type'] == 'income' else trans['amount']
+                cursor.execute(
+                    "UPDATE wallets SET balance = balance + ? WHERE id = ?",
+                    (adjustment, trans['wallet_id'])
+                )
+            
+            conn.commit()
+
+            # Show confirmation and refresh
+            await query.edit_message_text(
+                "✅ Transaction deleted successfully!",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back to Transactions", callback_data="back_to_transactions")]
+                ])
+            )
+            return MAIN_MENU
+
+        except Exception as e:
+            logger.error(f"Error deleting transaction: {str(e)}")
+            await query.edit_message_text(
+                "❌ Failed to delete transaction",
+                reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
+            )
+            return MAIN_MENU
 
 async def process_recurring_transactions(context: ContextTypes.DEFAULT_TYPE):
     today = datetime.datetime.now(TIMEZONE).day
@@ -799,6 +836,23 @@ async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Get all wallets with detailed info
         cursor.execute("SELECT * FROM wallets WHERE user_id = ?", (user_id,))
         wallets = cursor.fetchall()
+        
+        if not wallets:
+            if update.message:
+                await update.message.reply_text(
+                    "No wallets found. Please add a wallet first!",
+                    reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+            return MAIN_MENU
+        
+        # Get fresh financial data
+        cursor.execute("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE user_id = ? AND type = 'income'", (user_id,))
+        income = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE user_id = ? AND type = 'outcome'", (user_id,))
+        outcome = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COALESCE(SUM(amount), 0) FROM holds WHERE user_id = ?", (user_id,))
+        holds = cursor.fetchone()[0]
         
         if not wallets:
             if update.message:
@@ -1512,6 +1566,10 @@ async def add_income(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             reply_markup=ReplyKeyboardMarkup(cancel_keyboard, resize_keyboard=True))
         return ADD_INCOME
 
+async def back_to_transactions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    return await show_transactions_for_deletion(update, context)
 
 async def outcome_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
@@ -2472,7 +2530,7 @@ def main() -> None:
 
     # Create application with job queue
     try:
-        TOKEN = os.getenv("TELEGRAM_TOKEN", "8017763140:AAHD8fI9orJbnIyljuWF8PZN6yBmDxKuPrw")
+        TOKEN = os.getenv("TELEGRAM_TOKEN", "7847351145:AAEgUwSdwpYoLANB06PumVfTeQEH-I85EbM")
         application = Application.builder().token(TOKEN).build()
     except Exception as e:
         logger.error(f"Failed to create application: {e}")
@@ -2612,9 +2670,10 @@ def main() -> None:
     CallbackQueryHandler(holds_menu, pattern=r"^back_holds$"),
 ],
             MANAGE_TRANSACTIONS: [
-                CallbackQueryHandler(delete_transaction, pattern=r"^del_trans_"),
-                CallbackQueryHandler(start_over, pattern=r"^back_transactions")
-            ],
+    CallbackQueryHandler(delete_transaction, pattern=r"^del_trans_"),
+    CallbackQueryHandler(back_to_transactions, pattern=r"^back_to_transactions$"),
+    CallbackQueryHandler(start_over, pattern=r"^back_transactions$")
+],
             SET_BUDGET: [
                 CallbackQueryHandler(budget_category_selected, pattern=r"^budgetcat_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, save_budget),
