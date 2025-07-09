@@ -1188,11 +1188,17 @@ async def currency_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         for code, symbol in currencies[i:i+2]:
             row.append(InlineKeyboardButton(f"{code} {symbol}", callback_data=f"currency_{code}"))
         keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_currency")])
+    keyboard.append([InlineKeyboardButton("🔙 Back to Settings", callback_data="back_currency")])
     
-    await update.message.reply_text(
-        "Select your default currency:",
-        reply_markup=InlineKeyboardMarkup(keyboard))
+    if update.message:
+        await update.message.reply_text(
+            "Select your default currency:",
+            reply_markup=InlineKeyboardMarkup(keyboard))
+    elif update.callback_query:
+        await update.callback_query.message.reply_text(
+            "Select your default currency:",
+            reply_markup=InlineKeyboardMarkup(keyboard))
+    
     return CURRENCY_MENU
 
 async def set_currency(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1202,13 +1208,25 @@ async def set_currency(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     user_id = query.from_user.id
     
     with get_db_connection() as conn:
-        conn.execute("INSERT OR REPLACE INTO user_settings (user_id, default_currency) VALUES (?, ?)",
-                   (user_id, currency_code))
+        conn.execute(
+            "UPDATE user_settings SET default_currency = ? WHERE user_id = ?",
+            (currency_code, user_id)
+        )
         conn.commit()
     
+    # Edit the message instead of sending a new one
     await query.edit_message_text(
-        f"✅ Default currency set to {currency_code} {CURRENCIES.get(currency_code, '')}")
-    return await show_balance_menu(update, context)
+        f"✅ Default currency set to {currency_code} {CURRENCIES.get(currency_code, '')}",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Back to Settings", callback_data="back_to_settings")]
+        ])
+    )
+    return CURRENCY_MENU
+
+async def back_to_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    return await settings_menu(update, context)
 
 async def recurring_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     keyboard = [
@@ -2560,8 +2578,9 @@ def main() -> None:
                 MessageHandler(filters.Regex(r'^❌ Cancel$'), cancel)
             ],
             CURRENCY_MENU: [
-                CallbackQueryHandler(set_currency, pattern=r"^currency_"),
-                CallbackQueryHandler(start_over, pattern=r"^back_currency")
+    CallbackQueryHandler(set_currency, pattern=r"^currency_"),
+    CallbackQueryHandler(back_to_settings, pattern=r"^back_to_settings$"),
+    CallbackQueryHandler(settings_menu, pattern=r"^back_currency$")
             ],
             TRANSFER_AMOUNT: [
     MessageHandler(filters.TEXT & ~filters.COMMAND, process_transfer),
