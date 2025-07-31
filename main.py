@@ -2435,36 +2435,34 @@ async def show_recent_transactions(update: Update, context: ContextTypes.DEFAULT
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT * FROM transactions WHERE user_id = ? "
-            "ORDER BY date DESC",
+            "SELECT t.*, w.name as wallet_name FROM transactions t "
+            "LEFT JOIN wallets w ON t.wallet_id = w.id "
+            "WHERE t.user_id = ? "
+            "ORDER BY t.date DESC LIMIT 20",
             (user_id,)
         )
         transactions = cursor.fetchall()
 
     if not transactions:
-        await query.edit_message_caption(
-            caption="No transactions found!",
-            reply_markup=None
+        await query.edit_message_text(
+            "No transactions found!",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data="back_to_summary")]
+            ])
         )
         return MAIN_MENU
 
-    # Format each transaction with proper styling
     trans_text = "<b>📜 𝗧𝗿𝗮𝗻𝘀𝗮𝗰𝘁𝗶𝗼𝗻 𝗛𝗶𝘀𝘁𝗼𝗿𝘆</b>\n\n"
-    
     for t in transactions:
         date = format_transaction_date_long(t['date'])
         trans_type = "🟢 Income" if t['type'] == 'income' else "🔴 Expense"
         amount = t['amount']
         currency = t['currency']
-        wallet_name = get_wallet_name(t['wallet_id']) if t['wallet_id'] else "Unknown"
+        wallet_name = t['wallet_name'] or "Unknown"
         description = t['description']
         
-        # Format amount with color
         amount_str = format_money(abs(amount), currency)
-        if amount > 0:
-            amount_display = f"<b>+{amount_str}</b>"
-        else:
-            amount_display = f"<b>–{amount_str}</b>"
+        amount_display = f"<b>+{amount_str}</b>" if amount > 0 else f"<b>–{amount_str}</b>"
         
         trans_text += (
             f"<b>{date}</b>\n"
@@ -2473,22 +2471,25 @@ async def show_recent_transactions(update: Update, context: ContextTypes.DEFAULT
             f"📝 {description}\n\n"
         )
     
-    # Add pagination controls
     keyboard = [
-        [InlineKeyboardButton("🔙 Back to Summary", callback_data="back_to_summary")],
-        #[InlineKeyboardButton("🗑 Delete Transaction", callback_data="delete_transactions")]
+        [InlineKeyboardButton("🔙 Back to Summary", callback_data="back_to_summary")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Edit the caption of the existing photo message
-    await query.edit_message_caption(
-        caption=trans_text,
-        parse_mode='HTML',
-        reply_markup=reply_markup
-    )
+    try:
+        await query.message.reply_text(
+            trans_text,
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+    except Exception as e:
+        logger.error(f"Error showing transactions: {str(e)}")
+        await query.message.reply_text(
+            "Couldn't display transactions. Please try again.",
+            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
     
     return MAIN_MENU
-
+        
 async def back_to_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
