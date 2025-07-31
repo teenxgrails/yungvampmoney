@@ -2339,40 +2339,61 @@ async def transfer_hold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     user_id = query.from_user.id
 
     with get_db_connection() as conn:
-        hold = conn.execute("SELECT * FROM holds WHERE id = ?", (hold_id,)).fetchone()
-        if not hold:
-            await query.edit_message_text("Hold not found!")
-            return MAIN_MENU
-            
-        currency = hold['currency']
-        wallet_id = hold.get('wallet_id')
-        
-        # Create transaction
-        trans_type = 'income' if action == 'income' else 'outcome'
-        amount = hold['amount'] if action == 'income' else -hold['amount']
-        description = f"{'Released' if action == 'income' else 'Spent'} hold: {hold['description']}"
-        
-        # If hold was from a wallet, return funds when transferring to expense
-        if wallet_id and action == 'outcome':
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE wallets SET balance = balance + ? WHERE id = ?",
-                (hold['amount'], wallet_id)
-            )
-        
-        # Insert transaction
-        conn.execute(
-            "INSERT INTO transactions (user_id, type, amount, description, date, currency, wallet_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (user_id, trans_type, amount, description, get_current_datetime(), currency, wallet_id)
-        )
-        
-        # Remove hold
-        conn.execute("DELETE FROM holds WHERE id = ?", (hold_id,))
-        conn.commit()
+        try:
+            # Get hold details
+            hold = conn.execute("SELECT * FROM holds WHERE id = ?", (hold_id,)).fetchone()
+            if not hold:
+                await query.edit_message_text("Hold not found!")
+                return MAIN_MENU
 
-    await query.edit_message_text("✅ Hold processed successfully!")
-    return await show_balance_menu(update, context)
+            # Convert Row to dict for easier access
+            hold_dict = dict(hold)
+            currency = hold_dict['currency']
+            wallet_id = hold_dict['wallet_id'] if 'wallet_id' in hold_dict else None
+            
+            # Create transaction
+            trans_type = 'income' if action == 'income' else 'outcome'
+            amount = hold_dict['amount'] if action == 'income' else -hold_dict['amount']
+            description = f"{'Released' if action == 'income' else 'Spent'} hold: {hold_dict['description']}"
+            
+            # If hold was from a wallet, return funds when transferring to expense
+            if wallet_id and action == 'outcome':
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE wallets SET balance = balance + ? WHERE id = ?",
+                    (hold_dict['amount'], wallet_id)
+                )
+            
+            # Insert transaction
+            conn.execute(
+                "INSERT INTO transactions (user_id, type, amount, description, date, currency, wallet_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (user_id, trans_type, amount, description, get_current_datetime(), currency, wallet_id)
+            )
+            
+            # Remove hold
+            conn.execute("DELETE FROM holds WHERE id = ?", (hold_id,))
+            conn.commit()
+
+            # Use InlineKeyboardMarkup instead of ReplyKeyboardMarkup
+            await query.edit_message_text(
+                "✅ Hold processed successfully!",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back to Holds", callback_data="back_holds"),
+                     InlineKeyboardButton("📊 View Balance", callback_data="view_balance")]
+                ])
+            )
+            return MAIN_MENU
+
+        except Exception as e:
+            logger.error(f"Error transferring hold: {str(e)}")
+            await query.edit_message_text(
+                "❌ Failed to process hold",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back", callback_data=f"hold_{hold_id}")]
+                ])
+            )
+            return MAIN_MENU
 
 async def remove_hold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -2435,34 +2456,36 @@ async def show_recent_transactions(update: Update, context: ContextTypes.DEFAULT
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT t.*, w.name as wallet_name FROM transactions t "
-            "LEFT JOIN wallets w ON t.wallet_id = w.id "
-            "WHERE t.user_id = ? "
-            "ORDER BY t.date DESC LIMIT 20",
+            "SELECT * FROM transactions WHERE user_id = ? "
+            "ORDER BY date DESC",
             (user_id,)
         )
         transactions = cursor.fetchall()
 
     if not transactions:
-        await query.edit_message_text(
-            "No transactions found!",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back", callback_data="back_to_summary")]
-            ])
+        await query.edit_message_caption(
+            caption="No transactions found!",
+            reply_markup=None
         )
         return MAIN_MENU
 
+    # Format each transaction with proper styling
     trans_text = "<b>📜 𝗧𝗿𝗮𝗻𝘀𝗮𝗰𝘁𝗶𝗼𝗻 𝗛𝗶𝘀𝘁𝗼𝗿𝘆</b>\n\n"
+    
     for t in transactions:
         date = format_transaction_date_long(t['date'])
         trans_type = "🟢 Income" if t['type'] == 'income' else "🔴 Expense"
         amount = t['amount']
         currency = t['currency']
-        wallet_name = t['wallet_name'] or "Unknown"
+        wallet_name = get_wallet_name(t['wallet_id']) if t['wallet_id'] else "Unknown"
         description = t['description']
         
+        # Format amount with color
         amount_str = format_money(abs(amount), currency)
-        amount_display = f"<b>+{amount_str}</b>" if amount > 0 else f"<b>–{amount_str}</b>"
+        if amount > 0:
+            amount_display = f"<b>+{amount_str}</b>"
+        else:
+            amount_display = f"<b>–{amount_str}</b>"
         
         trans_text += (
             f"<b>{date}</b>\n"
@@ -2471,25 +2494,22 @@ async def show_recent_transactions(update: Update, context: ContextTypes.DEFAULT
             f"📝 {description}\n\n"
         )
     
+    # Add pagination controls
     keyboard = [
-        [InlineKeyboardButton("🔙 Back to Summary", callback_data="back_to_summary")]
+        [InlineKeyboardButton("🔙 Back to Summary", callback_data="back_to_summary")],
+        #[InlineKeyboardButton("🗑 Delete Transaction", callback_data="delete_transactions")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    try:
-        await query.message.reply_text(
-            trans_text,
-            parse_mode='HTML',
-            reply_markup=reply_markup
-        )
-    except Exception as e:
-        logger.error(f"Error showing transactions: {str(e)}")
-        await query.message.reply_text(
-            "Couldn't display transactions. Please try again.",
-            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
+    # Edit the caption of the existing photo message
+    await query.edit_message_caption(
+        caption=trans_text,
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
     
     return MAIN_MENU
-        
+
 async def back_to_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -2531,7 +2551,7 @@ def main() -> None:
 
     # Create application with job queue
     try:
-        TOKEN = os.getenv("TELEGRAM_TOKEN", "8017763140:AAFi4RNvu9HwFO-LA0bmtf9pOyNx-85Slno")
+        TOKEN = os.getenv("TELEGRAM_TOKEN", "7847351145:AAEgUwSdwpYoLANB06PumVfTeQEH-I85EbM")
         application = Application.builder().token(TOKEN).build()
     except Exception as e:
         logger.error(f"Failed to create application: {e}")
