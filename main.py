@@ -1,6 +1,7 @@
 import datetime
 import logging
 import sqlite3
+import time
 import pytz
 import subprocess
 import matplotlib.pyplot as plt
@@ -8,6 +9,8 @@ import calendar
 import json
 import requests
 import os
+from typing import Optional
+from datetime import datetime, timedelta
 from matplotlib.ticker import FuncFormatter
 from io import BytesIO
 from telegram import (
@@ -23,8 +26,9 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
     CallbackQueryHandler,
+    Updater,
     filters,
-    JobQueue
+    JobQueue,
 )
 
 # --- Database Setup --- #
@@ -161,23 +165,42 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Helper Functions --- #
+def format_datetime(dt: datetime, format_str: str = "%Y-%m-%d %H:%M:%S") -> str:
+    """Safe datetime formatter with timezone conversion"""
+    if dt.tzinfo is None:
+        dt = TIMEZONE.localize(dt)
+    return dt.strftime(format_str)
+
 def format_transaction_date_long(db_date):
     if not db_date:
         return "no date"
     try:
-        dt = datetime.datetime.strptime(db_date, "%Y-%m-%d %H:%M:%S")
+        dt = datetime.strptime(db_date, "%Y-%m-%d %H:%M:%S")  # Use imported datetime
         return dt.strftime("%Y-%m-%d %H:%M")
     except:
         return db_date.split()[0] if db_date else "no date"
     
+    
+def get_menu_keyboard(state):
+    keyboards = {
+        'MAIN_MENU': main_keyboard,
+        'MANAGE_HOLDS': [
+            ['➕ Normal Hold', '➕ From Wallet'],
+            ['🛠 Manage Hold'],
+            ['🔙 Back']
+        ],
+    }
+    return keyboards.get(state, main_keyboard)
+
 def format_transaction_date(db_date):
+    """Format database date for display"""
     if not db_date:
-        return "no date"
+        return "No date"
     try:
-        dt = datetime.datetime.strptime(db_date, "%Y-%m-%d %H:%M:%S")
-        return dt.strftime("%b %d")
-    except:
-        return db_date.split()[0] if db_date else "no date"
+        dt = datetime.strptime(db_date, "%Y-%m-%d %H:%M:%S")
+        return dt.strftime("%b %d %H:%M")
+    except ValueError:
+        return db_date.split()[0]  # Just return date part if parsing fails
     
 def get_user_currency(user_id):
     with get_db_connection() as conn:
@@ -263,8 +286,8 @@ def get_monthly_summary(user_id, month, year):
     }
 
 def get_current_datetime():
-    now = datetime.datetime.now(TIMEZONE)
-    return now.strftime("%Y-%m-%d %H:%M:%S")
+    """Return current datetime in the correct timezone"""
+    return datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
 
 async def set_budget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
@@ -320,6 +343,9 @@ async def add_hold_from_wallet(update: Update, context: ContextTypes.DEFAULT_TYP
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_wallet_actions")]])
     )
     return ADD_HOLD_FROM_WALLET
+
+async def is_message_deletable(message):
+    return datetime.utcnow() - message.date < timedelta(hours=48)
 
 async def process_hold_from_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
@@ -468,7 +494,7 @@ async def save_budget(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return MAIN_MENU
             
         currency = get_user_currency(user_id)
-        now = datetime.datetime.now(TIMEZONE)
+        now = datetime.now(TIMEZONE)
         
         with get_db_connection() as conn:
             cursor = conn.cursor()
@@ -530,7 +556,7 @@ async def show_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await settings_menu(update, context)
         
     user_id = query.from_user.id
-    now = datetime.datetime.now(TIMEZONE)
+    now = datetime.now(TIMEZONE)
     currency = get_user_currency(user_id)
     
     if report_type == "Monthly Summary":
@@ -629,7 +655,7 @@ async def backup_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def notify_budget_updates(context: ContextTypes.DEFAULT_TYPE):
     """Send weekly budget updates to users"""
-    now = datetime.datetime.now(TIMEZONE)
+    now = datetime.now(TIMEZONE)
     
     with get_db_connection() as conn:
         users = conn.execute("SELECT DISTINCT user_id FROM budgets").fetchall()
@@ -678,41 +704,89 @@ async def notify_budget_updates(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_transactions_for_deletion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.message.from_user.id
+    # Handle both Message and CallbackQuery updates
+    if update.callback_query:
+        user_id = update.callback_query.from_user.id
+        message_method = update.callback_query.edit_message_text
+    else:
+        user_id = update.message.from_user.id
+        message_method = update.message.reply_text
+
     currency = get_user_currency(user_id)
     
     with get_db_connection() as conn:
         transactions = conn.execute(
-            "SELECT * FROM transactions WHERE user_id = ? "
-            "ORDER BY date DESC LIMIT 50",
+            """SELECT t.id, t.type, t.amount, t.description, t.date, t.currency, 
+                  t.wallet_id, w.name as wallet_name, c.name as category
+               FROM transactions t
+               LEFT JOIN wallets w ON t.wallet_id = w.id
+               LEFT JOIN categories c ON t.category_id = c.id
+               WHERE t.user_id = ?
+               ORDER BY t.date DESC LIMIT 50""",
             (user_id,)
         ).fetchall()
 
     if not transactions:
-        await update.message.reply_text(
+        await message_method(
             "No transactions found!",
             reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
         return MAIN_MENU
 
+    # Build the transaction list message
+    message_lines = []
     keyboard = []
+    
     for idx, t in enumerate(transactions, 1):
-        date = format_transaction_date(t['date'])
+        # Format transaction details
+        date_str = format_transaction_date(t['date'])
+        amount = abs(t['amount'])
         trans_type = "Income" if t['type'] == 'income' else "Expense"
-        amount = t['amount'] if t['amount'] > 0 else -t['amount']
-        trans_currency = t['currency'] if 'currency' in t.keys() else currency
-        description = t['description'][:20] + '...' if len(t['description']) > 20 else t['description']
+        currency_symbol = CURRENCIES.get(t['currency'], t['currency'])
+        wallet_info = f"({t['wallet_name']})" if t['wallet_name'] else ""
+        category_info = f" [{t['category']}]" if t['category'] else ""
         
-        button_text = (
-            f"{idx}. {date} | {trans_type} | "
-            f"{format_money(amount, trans_currency)} | {description}"
-        )
+        # Format the button text (limited to 50 chars for Telegram limits)
+        button_text = (f"{idx}. {date_str} | {trans_type[0]} "
+                      f"{currency_symbol}{amount:,.2f} | "
+                      f"{t['description'][:20]}{'...' if len(t['description']) > 20 else ''}")
+        button_text = button_text[:50]  # Ensure it fits in button
+        
+        # Add to keyboard
         keyboard.append([InlineKeyboardButton(button_text, callback_data=f"del_trans_{t['id']}")])
+        
+        # Add to message text (for cases where we can't show buttons)
+        message_lines.append(
+            f"{idx}. {date_str} | {trans_type} | "
+            f"{currency_symbol}{amount:,.2f}{wallet_info}{category_info}\n"
+            f"   {t['description']}\n"
+        )
 
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_transactions")])
+    # Add navigation buttons
+    keyboard.extend([
+        [InlineKeyboardButton("🔄 Refresh", callback_data="refresh_transactions")],
+        [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]
+    ])
 
-    await update.message.reply_text(
-        "Select a transaction to delete:",
-        reply_markup=InlineKeyboardMarkup(keyboard))
+    # Prepare the full message
+    message_text = "🗑 Select a transaction to delete:\n\n" + "\n".join(message_lines[:10])  # Show first 10 in message
+    
+    try:
+        # Try to edit existing message if this is a callback
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                message_text,
+                reply_markup=InlineKeyboardMarkup(keyboard))
+        else:
+            await update.message.reply_text(
+                message_text,
+                reply_markup=InlineKeyboardMarkup(keyboard))
+    except Exception as e:
+        logger.error(f"Error showing transactions: {str(e)}")
+        # Fallback to simple message if rich formatting fails
+        await message_method(
+            "Select a transaction to delete:",
+            reply_markup=InlineKeyboardMarkup(keyboard))
+
     return MANAGE_TRANSACTIONS
 
 async def delete_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -731,13 +805,18 @@ async def delete_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE)
             ).fetchone()
 
             if not trans:
-                await query.edit_message_text("❌ Transaction not found!")
-                return await show_transactions_for_deletion(update, context)
+                await query.edit_message_text(
+                    "❌ Transaction not found!",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔙 Back to Transactions", callback_data="back_transactions")]
+                    ])
+                )
+                return MANAGE_TRANSACTIONS
 
             # Delete the transaction
             cursor.execute("DELETE FROM transactions WHERE id = ?", (trans_id,))
             
-            # Update wallet balance
+            # Update wallet balance if transaction was linked to a wallet
             if trans['wallet_id']:
                 adjustment = -trans['amount'] if trans['type'] == 'income' else trans['amount']
                 cursor.execute(
@@ -747,24 +826,130 @@ async def delete_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE)
             
             conn.commit()
 
-            # Show confirmation and refresh
-            await query.edit_message_text(
-                "✅ Transaction deleted successfully!",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back to Transactions", callback_data="back_to_transactions")]
-                ])
-            )
-            return MAIN_MENU
+            # Get updated transaction count
+            remaining_count = cursor.execute(
+                "SELECT COUNT(*) FROM transactions WHERE user_id = ?",
+                (user_id,)
+            ).fetchone()[0]
+
+            if remaining_count > 0:
+                # Show success message with option to refresh or go back
+                await query.edit_message_text(
+                    f"✅ Transaction deleted successfully!\nRemaining transactions: {remaining_count}",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Refresh List", callback_data="refresh_transactions")],
+                        [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]
+                    ])
+                )
+            else:
+                # No transactions left, return to main menu
+                await query.edit_message_text(
+                    "✅ Transaction deleted successfully!\nNo more transactions found.",
+                    reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
+                )
+                return MAIN_MENU
+
+            return MANAGE_TRANSACTIONS
 
         except Exception as e:
             logger.error(f"Error deleting transaction: {str(e)}")
             await query.edit_message_text(
                 "❌ Failed to delete transaction",
-                reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back to Transactions", callback_data="back_transactions")],
+                    [InlineKeyboardButton("🏠 Main Menu", callback_data="back_to_menu")]
+                ])
             )
-            return MAIN_MENU
+            return MANAGE_TRANSACTIONS
+
+async def refresh_transactions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await show_transactions_for_deletion(update, context)
 
 async def process_recurring_transactions(context: ContextTypes.DEFAULT_TYPE):
+    """Process recurring transactions on their scheduled day"""
+    try:
+        now = datetime.now(TIMEZONE)
+        today = now.day
+        logger.info(f"Processing recurring transactions for day {today}")
+
+        with get_db_connection() as conn:
+            recurring = conn.execute(
+                "SELECT * FROM recurring WHERE day_of_month = ? AND is_active = 1", 
+                (today,)
+            ).fetchall()
+
+            if not recurring:
+                logger.info("No recurring transactions to process today")
+                return
+
+            for transaction in recurring:
+                user_id = transaction['user_id']
+                try:
+                    # Get default wallet
+                    wallet_id = get_default_wallet(user_id)
+                    if not wallet_id:
+                        logger.warning(f"No default wallet for user {user_id}, skipping transaction")
+                        continue
+                    
+                    # Get wallet currency
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT currency FROM wallets WHERE id = ?", (wallet_id,))
+                    wallet_result = cursor.fetchone()
+                    if not wallet_result:
+                        logger.error(f"Wallet {wallet_id} not found for user {user_id}")
+                        continue
+                    wallet_currency = wallet_result['currency']
+                    
+                    # Convert currency if needed
+                    amount = transaction['amount']
+                    if transaction['currency'] != wallet_currency:
+                        try:
+                            converted_amount = convert_currency(amount, transaction['currency'], wallet_currency)
+                            currency = wallet_currency
+                        except Exception as conv_e:
+                            logger.error(f"Currency conversion failed: {str(conv_e)}")
+                            # Fallback to original currency
+                            converted_amount = amount
+                            currency = transaction['currency']
+                    else:
+                        converted_amount = amount
+                        currency = transaction['currency']
+                    
+                    # Handle outcome type (should be negative)
+                    if transaction['type'] == 'outcome':
+                        transaction_amount = -converted_amount
+                    else:
+                        transaction_amount = converted_amount
+
+                    # Insert transaction
+                    cursor.execute(
+                        "INSERT INTO transactions (user_id, type, amount, description, date, currency, wallet_id) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (user_id, transaction['type'], transaction_amount, 
+                         transaction['description'], now.strftime("%Y-%m-%d %H:%M:%S"), currency, wallet_id)
+                    )
+                    
+                    # Update wallet balance
+                    cursor.execute(
+                        "UPDATE wallets SET balance = balance + ? WHERE id = ?",
+                        (transaction_amount, wallet_id)
+                    )
+                    
+                    logger.info(f"Processed recurring transaction for user {user_id}: {transaction['description']}")
+                    
+                except sqlite3.Error as db_e:
+                    logger.error(f"Database error processing recurring transaction: {str(db_e)}")
+                    conn.rollback()
+                except Exception as e:
+                    logger.error(f"Unexpected error processing recurring transaction: {str(e)}")
+                    conn.rollback()
+                
+                # Commit after each transaction to prevent full rollback on error
+                conn.commit()
+
+    except Exception as e:
+        logger.critical(f"Critical error in recurring transactions processor: {str(e)}")
+
     today = datetime.datetime.now(TIMEZONE).day
     with get_db_connection() as conn:
         recurring = conn.execute("SELECT * FROM recurring WHERE day_of_month = ? AND is_active = 1", 
@@ -819,72 +1004,28 @@ async def show_balance_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return MAIN_MENU
 
 async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message:
-        user_id = update.message.from_user.id
-    elif update.callback_query:
+    """Display balance information across two pages with navigation buttons"""
+    # Get user and current page
+    if update.callback_query:
         user_id = update.callback_query.from_user.id
+        # Update current page if navigating
+        if update.callback_query.data.startswith('balance_page_'):
+            context.user_data['balance_page'] = int(update.callback_query.data.split('_')[-1])
     else:
-        return MAIN_MENU
-        
+        user_id = update.message.from_user.id
+        # Default to page 1 if coming from command
+        context.user_data['balance_page'] = 1
+    
+    current_page = context.user_data.get('balance_page', 1)
     currency = get_user_currency(user_id)
-    now = datetime.datetime.now(TIMEZONE)
-    currency_symbol = CURRENCIES.get(currency, '')
+    now = datetime.now(TIMEZONE)  # Fixed: datetime.datetime.now() → datetime.now()
     
     with get_db_connection() as conn:
+        # Get wallet balances
         cursor = conn.cursor()
-        
-        # Get all wallets with detailed info
         cursor.execute("SELECT * FROM wallets WHERE user_id = ?", (user_id,))
         wallets = cursor.fetchall()
         
-        if not wallets:
-            if update.message:
-                await update.message.reply_text(
-                    "No wallets found. Please add a wallet first!",
-                    reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
-            return MAIN_MENU
-        
-        # Get fresh financial data
-        cursor.execute("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE user_id = ? AND type = 'income'", (user_id,))
-        income = cursor.fetchone()[0]
-        
-        cursor.execute("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE user_id = ? AND type = 'outcome'", (user_id,))
-        outcome = cursor.fetchone()[0]
-        
-        cursor.execute("SELECT COALESCE(SUM(amount), 0) FROM holds WHERE user_id = ?", (user_id,))
-        holds = cursor.fetchone()[0]
-        
-        if not wallets:
-            if update.message:
-                await update.message.reply_text(
-                    "No wallets found. Please add a wallet first!",
-                    reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
-            return MAIN_MENU
-        
-        # Prepare wallet details
-        wallet_details = []
-        total_balance = 0
-        for wallet in wallets:
-            wallet_balance = wallet['balance']
-            wallet_currency = wallet['currency']
-            wallet_symbol = CURRENCIES.get(wallet_currency, '')
-            converted_balance = convert_currency(wallet_balance, wallet_currency, currency)
-            total_balance += converted_balance
-            
-            # Choose icon based on wallet name
-            wallet_icon = "🏦" if "bank" in wallet['name'].lower() else "💵"
-            wallet_icon = "🏦" if "post" in wallet['name'].lower() else wallet_icon
-            wallet_icon = "💳" if "card" in wallet['name'].lower() else wallet_icon
-            wallet_icon = "💰" if "cash" in wallet['name'].lower() else wallet_icon
-            
-            # Format with right alignment
-            balance_str = f"{format_money(wallet_balance, wallet_currency)}"
-            wallet_details.append(
-                f"{wallet_icon} {wallet['name']}:"
-                f"{balance_str:>20} "
-                f"{'✅' if wallet['is_default'] else ''}"
-            )
-
         # Get financial data
         cursor.execute("SELECT SUM(amount) FROM transactions WHERE user_id = ? AND type = 'income'", (user_id,))
         income = cursor.fetchone()[0] or 0
@@ -895,144 +1036,99 @@ async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor.execute("SELECT SUM(amount) FROM holds WHERE user_id = ?", (user_id,))
         holds = cursor.fetchone()[0] or 0
         
+        # Calculate metrics
         balance = income + outcome
         total_expenses = -outcome if outcome < 0 else outcome
+        savings_rate = (income + outcome) / income * 100 if income else 0
+        avg_daily_spending = total_expenses / now.day if now.day else 0
+        total_with_holds = balance + holds
 
-        # Get monthly spending by category with icons
-        category_icons = {
-            'Food': '🍔',
-            'Transport': '🚖',
-            'Housing': '🏠',
-            'Entertainment': '🎮',
-            'Healthcare': '⚕️',
-            'Other': '📦'
-        }
+    # Page 1: Wallet Balances
+    if current_page == 1:
+        text = "👛 <b>𝗪𝗮𝗹𝗹𝗲𝘁 𝗕𝗮𝗹𝗮𝗻𝗰𝗲𝘀</b>\n\n"
         
-        cursor.execute(
-            """SELECT c.name, SUM(t.amount) as total 
-               FROM transactions t 
-               JOIN categories c ON t.category_id = c.id 
-               WHERE t.user_id = ? AND t.type = 'outcome' 
-               AND strftime('%Y-%m', t.date) = ? 
-               GROUP BY c.name""",
-            (user_id, now.strftime("%Y-%m")))
-        spending_by_category = cursor.fetchall()
+        # Wallet details
+        for wallet in wallets:
+            wallet_icon = "🏦" if "bank" in wallet['name'].lower() else "💵"
+            wallet_icon = "🏦" if "post" in wallet['name'].lower() else wallet_icon
+            wallet_icon = "💳" if "card" in wallet['name'].lower() else wallet_icon
+            wallet_icon = "💰" if "cash" in wallet['name'].lower() else wallet_icon
+            
+            text += (
+                f"{wallet_icon} {wallet['name']}: "
+                f"{format_money(wallet['balance'], wallet['currency']):>20} "
+                f"{'✅' if wallet['is_default'] else ''}\n"
+            )
+        
+        # Total balance and held amount with new styling
+        text += (
+            f"\n🟩 <b>𝗧𝗼𝘁𝗮𝗹 𝗕𝗮𝗹𝗮𝗻𝗰𝗲:</b> {format_money(balance, currency):>16}\n"
+            f"🟧 <b>𝗛𝗲𝗹𝗱 𝗔𝗺𝗼𝘂𝗻𝘁:</b> {format_money(holds, currency):>16}\n"
+            f"▫️ <b>Total + Hold:</b> {format_money(total_with_holds, currency):>16}\n"
+        )
+        
+        # Navigation buttons
+        keyboard = [
+            [InlineKeyboardButton("➡️ Financial Summary", callback_data="balance_page_2")],
+            [InlineKeyboardButton("📝 Recent Transactions", callback_data="show_recent_trans")]
+        ]
 
-    # Calculate metrics
-    savings_rate = (income + outcome) / income * 100 if income else 0
-    avg_daily_spending = total_expenses / now.day if now.day else 0
-    
-    # Create progress bar for savings rate
-    def progress_bar(percentage):
-        filled = '▓' * int(percentage / 10)
-        empty = '░' * (10 - len(filled))
-        return f"{filled}{empty}"
-    
-    # Format all monetary values consistently
-    def fm(amount):
-        return format_money(amount, currency)
-    
-    # Create formatted text with wallet details
-    text_summary = (
-        f"💠 <b>𝗙𝗶𝗻𝗮𝗻𝗰𝗶𝗮𝗹 𝗦𝘂𝗺𝗺𝗮𝗿𝘆</b> – {now.strftime('%B %Y')}\n\n"
+    # Page 2: Financial Summary (without divider line)
+    else:
+        text = (
+            f"💠 <b>𝗙𝗶𝗻𝗮𝗻𝗰𝗶𝗮𝗹 𝗦𝘂𝗺𝗺𝗮𝗿𝘆</b> – {now.strftime('%B %Y')}\n\n"
+            f"📈 <b>𝗜𝗻𝗰𝗼𝗺𝗲:</b>           +{format_money(income, currency):>16}\n"
+            f"📉 <b>𝗘𝘅𝗽𝗲𝗻𝘀𝗲𝘀:</b>          –{format_money(total_expenses, currency):>16}\n\n"
+            f"💸 <b>Savings Rate:</b>     {savings_rate:.1f}%\n"
+            f"🗓️ <b>Avg Daily Spend:</b>  {format_money(avg_daily_spending, currency):>16}\n\n"
+        )
         
-        f"👛 <b>𝗪𝗮𝗹𝗹𝗲𝘁 𝗕𝗮𝗹𝗮𝗻𝗰𝗲𝘀</b>\n" + "\n".join(wallet_details) + "\n\n"
+        # Financial health indicator
+        financial_health = "✅ Excellent" if balance > 0 else "⚠️ Breaking Even" if balance == 0 else "❌ Over Budget"
+        text += f"<b>{financial_health} 𝗙𝗶𝗻𝗮𝗻𝗰𝗶𝗮𝗹 𝗛𝗲𝗮𝗹𝘁𝗵</b>"
         
-        f"<b>💳 𝗧𝗼𝘁𝗮𝗹 𝗕𝗮𝗹𝗮𝗻𝗰𝗲:</b> {fm(total_balance):>16}\n\n"
-        #f"<b>🌍 𝗖𝘂𝗿𝗿𝗲𝗻𝗰𝘆:</b> {currency} {currency_symbol:>22}\n\n"
-        
-        "───────────────\n\n"
-        
-        f"<b>📈 𝗜𝗻𝗰𝗼𝗺𝗲:</b>           +{fm(income)}\n"
-        f"<b>📉 𝗘𝘅𝗽𝗲𝗻𝘀𝗲𝘀:</b>          –{fm(total_expenses)}\n"
-        f"<b>⏳ 𝗛𝗲𝗹𝗱 𝗔𝗺𝗼𝘂𝗻𝘁:</b>      {fm(holds)}\n\n"
-        
-        #f"<b>📊 𝗠𝗲𝘁𝗿𝗶𝗰𝘀</b>\n"
-        f"💸 <b>Savings Rate:</b>     {savings_rate:.1f}%\n"
-        f"🗓️ <b>Avg Daily Spend:</b>  {fm(avg_daily_spending)}\n\n"
-    )
+        # Navigation buttons
+        keyboard = [
+            [InlineKeyboardButton("⬅️ Wallet Balances", callback_data="balance_page_1")],
+            [InlineKeyboardButton("📝 Recent Transactions", callback_data="show_recent_trans")]
+        ]
     
-    # Add spending by category if available
-    if spending_by_category:
-        text_summary += f"<b>📋 𝗦𝗽𝗲𝗻𝗱𝗶𝗻𝗴 𝗕𝘆 𝗖𝗮𝘁𝗲𝗴𝗼𝗿𝘆</b>\n"
-        for category in spending_by_category:
-            category_name = category['name']
-            category_total = -category['total']  # expenses are negative
-            icon = category_icons.get(category_name, '•')
-            text_summary += f"{icon} {category_name}: {fm(category_total):>15}\n"
-        text_summary += "\n"
-    
-    # Add financial health indicator
-    financial_health = "✅ Excellent" if balance > 0 else "⚠️ Breaking Even" if balance == 0 else "❌ Over Budget"
-    text_summary += f"<b>{financial_health} 𝗙𝗶𝗻𝗮𝗻𝗰𝗶𝗮𝗹 𝗛𝗲𝗮𝗹𝘁𝗵</b>"
-
-    # Create visualization
-    plt.style.use('default')
-    fig, ax = plt.subplots(figsize=(8, 6), facecolor='#F2F2F7')
-    fig.patch.set_alpha(0)
-    
-    ios_colors = {
-        'income': '#32D74B',
-        'expenses': '#FF453A',
-        'holds': '#FF9F0A',
-        'background': '#F2F2F7',
-        'text': '#1C1C1E'
-    }
-    
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    ax.grid(False)
-    
-    sizes = [income, total_expenses, holds]
-    labels = [f'Income\n{fm(income)}', 
-              f'Expenses\n{fm(total_expenses)}', 
-              f'Holds\n{fm(holds)}']
-    colors = [ios_colors['income'], ios_colors['expenses'], ios_colors['holds']]
-    
-    wedges, texts = ax.pie(sizes, colors=colors, startangle=90, 
-                          wedgeprops=dict(width=0.5, edgecolor='none'))
-    
-    for text in texts:
-        text.set_color(ios_colors['text'])
-        text.set_fontsize(10)
-        text.set_fontweight('medium')
-    
-    center_text = f"Balance\n{fm(balance)}"
-    ax.text(0, 0, center_text, ha='center', va='center', 
-           fontsize=18, fontweight='bold', color=ios_colors['text'])
-    
-    for wedge in wedges:
-        wedge.set_edgecolor('#D1D1D6')
-        wedge.set_linewidth(0.5)
-    
-    plt.tight_layout()
-    
-    buf = BytesIO()
-    plt.savefig(buf, format='png', dpi=120, transparent=True, 
-               bbox_inches='tight', pad_inches=0.1)
-    buf.seek(0)
-    plt.close(fig)
-    
-    # Create keyboard with "Show Recent Transactions" button
-    keyboard = [[InlineKeyboardButton("📝 Show Recent Transactions", callback_data="show_recent_trans")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-
-    # Send the message
-    if update.message:
-        await update.message.reply_photo(
-            photo=buf,
-            caption=text_summary,
+    
+    # Send/update message
+    if update.callback_query:
+        try:
+            await update.callback_query.answer()
+            try:
+                await update.callback_query.message.edit_text(
+                    text,
+                    parse_mode='HTML',
+                    reply_markup=reply_markup
+                )
+            except Exception as e:
+                # Fallback if message needs to be replaced
+                await update.callback_query.message.delete()
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=text,
+                    parse_mode='HTML',
+                    reply_markup=reply_markup
+                )
+        except Exception as e:
+            logger.error(f"Error updating balance message: {str(e)}")
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="An error occurred. Please try again.",
+                reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
+            )
+    else:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=text,
             parse_mode='HTML',
             reply_markup=reply_markup
         )
-    elif update.callback_query:
-        await update.callback_query.message.reply_photo(
-            photo=buf,
-            caption=text_summary,
-            parse_mode='HTML',
-            reply_markup=reply_markup
-        )
-
+    
     return MAIN_MENU
 
 async def update_code1(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1228,11 +1324,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                        (user.id, 'USD'))
             conn.commit()
     
-    await update.message.reply_text(
-        f"Welcome to Budget Planner, {user.first_name}!\n"
-        "Use the buttons below to manage your finances:",
-        reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
-    return MAIN_MENU
+    # Remove the welcome message and directly show balance
+    return await show_balance(update, context)
 
 async def currency_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     keyboard = []
@@ -1655,6 +1748,7 @@ async def add_outcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
         return MAIN_MENU
     
+    
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT currency FROM wallets WHERE id = ?", (wallet_id,))
@@ -1729,10 +1823,6 @@ async def add_outcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 async def holds_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        if not update.effective_message or not update.effective_user:
-            logger.error("Invalid update received in holds_menu")
-            return MAIN_MENU
-
         user_id = update.effective_user.id
         
         with get_db_connection() as conn:
@@ -1744,6 +1834,11 @@ async def holds_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 ['➕ Normal Hold', '➕ From Wallet'],
                 ['🔙 Back']
             ]
+            await update.effective_message.reply_text(
+                text,
+                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+            return MANAGE_HOLDS
+        
         else:
             # Fix: Use dictionary access with fallback instead of .get()
             holds_list = "\n".join(
@@ -2300,6 +2395,173 @@ async def apply_tag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"hold_{hold_id}")]]))
     return MANAGE_HOLDS
 
+async def back_to_holds(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    
+    # Explicitly show holds menu keyboard
+    await query.edit_message_text(
+        "Hold management:",
+        reply_markup=ReplyKeyboardMarkup([
+            ['➕ Normal Hold', '➕ From Wallet'],
+            ['🛠 Manage Hold'],
+            ['🔙 Back']
+        ], resize_keyboard=True))
+    return MANAGE_HOLDS
+
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        await query.answer()
+        
+        # Handle different callback patterns
+        if query.data.startswith('balance_page_'):
+            return await show_balance(update, context)
+        elif query.data == 'show_recent_trans':
+            return await show_recent_transactions(update, context)
+        elif query.data == 'back_to_summary':
+            return await back_to_summary(update, context)
+        # Add other patterns as needed
+        
+    except Exception as e:
+        logger.error(f"Callback query error: {str(e)}")
+        try:
+            await query.edit_message_text(
+                "❌ An error occurred. Returning to main menu.",
+                reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
+            )
+        except:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="❌ An error occurred. Returning to main menu.",
+                reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
+            )
+        return MAIN_MENU
+        
+
+async def handle_quick_entries(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text
+    user_id = update.message.from_user.id
+    default_wallet = get_default_wallet(user_id)
+    
+    try:
+        if text.startswith('+'):
+            # Income entry: +1000 Salary
+            amount = float(text[1:].split()[0])
+            description = ' '.join(text[1:].split()[1:]) or "Income"
+            return await process_quick_income(update, context, amount, description, default_wallet)
+            
+        elif text.startswith('-'):
+            # Expense entry: -1000 Groceries
+            amount = float(text[1:].split()[0])
+            description = ' '.join(text[1:].split()[1:]) or "Expense"
+            return await process_quick_outcome(update, context, amount, description, default_wallet)
+            
+        elif text.startswith('!'):
+            # Hold entry: !1000 Vacation
+            amount = float(text[1:].split()[0])
+            description = ' '.join(text[1:].split()[1:]) or "Hold"
+            return await process_quick_hold(update, context, amount, description)
+            
+    except (ValueError, IndexError):
+        await update.message.reply_text(
+            "Invalid format. Examples:\n"
+            "+1000 Salary\n"
+            "-50 Groceries\n"
+            "!200 Vacation",
+            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+        return MAIN_MENU
+
+async def process_quick_income(update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                             amount: float, description: str, wallet_id: int) -> int:
+    currency = get_user_currency(update.message.from_user.id)
+    
+    with get_db_connection() as conn:
+        conn.execute(
+            "INSERT INTO transactions (user_id, type, amount, description, date, currency, wallet_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (update.message.from_user.id, 'income', amount, description, 
+             get_current_datetime(), currency, wallet_id)
+        )
+        conn.execute(
+            "UPDATE wallets SET balance = balance + ? WHERE id = ?",
+            (amount, wallet_id)
+        )
+        conn.commit()
+    
+    await update.message.reply_text(
+        f"✅ Income recorded: {format_money(amount, currency)}\n"
+        f"📝 Description: {description}",
+        reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+    
+    return await show_balance(update, context)
+
+async def process_quick_outcome(update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                              amount: float, description: str, wallet_id: int) -> int:
+    currency = get_user_currency(update.message.from_user.id)
+    category = detect_category(description)
+    
+    with get_db_connection() as conn:
+        # Get or create category
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM categories WHERE name = ?", (category,))
+        cat_row = cursor.fetchone()
+        category_id = cat_row[0] if cat_row else None
+        
+        # Insert transaction
+        cursor.execute(
+            "INSERT INTO transactions (user_id, type, amount, description, date, currency, category_id, wallet_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (update.message.from_user.id, 'outcome', -amount, description, 
+             get_current_datetime(), currency, category_id, wallet_id)
+        )
+        
+        # Update wallet balance
+        cursor.execute(
+            "UPDATE wallets SET balance = balance - ? WHERE id = ?",
+            (amount, wallet_id)
+        )
+        conn.commit()
+    
+    await update.message.reply_text(
+        f"✅ Expense recorded: {format_money(amount, currency)}\n"
+        f"📝 Description: {description}\n"
+        f"🏷 Category: {category}",
+        reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+    
+    return await show_balance(update, context)
+
+async def process_quick_hold(update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                           amount: float, description: str) -> int:
+    currency = get_user_currency(update.message.from_user.id)
+    
+    with get_db_connection() as conn:
+        conn.execute(
+            "INSERT INTO holds (user_id, amount, description, currency) "
+            "VALUES (?, ?, ?, ?)",
+            (update.message.from_user.id, amount, description, currency)
+        )
+        conn.commit()
+    
+    await update.message.reply_text(
+        f"✅ Hold created: {format_money(amount, currency)}\n"
+        f"📝 Description: {description}",
+        reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+    
+    return await show_balance(update, context)
+
+async def start_over(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            "Returning to main menu...")
+    
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="Main Menu",
+        reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
+    return MAIN_MENU
+
 async def save_hold_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.message.from_user.id
     new_description = update.message.text
@@ -2376,13 +2638,10 @@ async def transfer_hold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             conn.commit()
 
             # Use InlineKeyboardMarkup instead of ReplyKeyboardMarkup
+              # After successful transfer, show main menu
             await query.edit_message_text(
-                "✅ Hold processed successfully!",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back to Holds", callback_data="back_holds"),
-                     InlineKeyboardButton("📊 View Balance", callback_data="view_balance")]
-                ])
-            )
+        "✅ Hold processed successfully!",
+        reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True))
             return MAIN_MENU
 
         except Exception as e:
@@ -2404,17 +2663,33 @@ async def remove_hold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         conn.execute("DELETE FROM holds WHERE id = ?", (hold_id,))
         conn.commit()
 
-    await query.edit_message_text("✅ Hold removed successfully!")
-    return await show_balance_menu(update, context)
+    try:
+        # First delete the original message with inline keyboard
+        await query.message.delete()
+    except Exception as e:
+        logger.warning(f"Could not delete message: {e}")
 
-async def start_over(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    reply_text = "Back to main menu:"
-    reply_markup = ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
+    # Then send a new message with the reply keyboard
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text="✅ Hold removed successfully!",
+        reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
+    )
     
-    if update.callback_query:
-        await update.callback_query.message.reply_text(reply_text, reply_markup=reply_markup)
-    else:
-        await update.message.reply_text(reply_text, reply_markup=reply_markup)
+    return MAIN_MENU
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.message.from_user
+    
+    with get_db_connection() as conn:
+        user_exists = conn.execute("SELECT 1 FROM user_settings WHERE user_id = ?", 
+                                 (user.id,)).fetchone()
+        if not user_exists:
+            conn.execute("INSERT INTO user_settings (user_id, default_currency) VALUES (?, ?)",
+                       (user.id, 'USD'))
+            conn.commit()
+    
+    await show_balance(update, context)
     return MAIN_MENU
 
 async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2452,76 +2727,113 @@ async def show_recent_transactions(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
+    currency = get_user_currency(user_id)
     
     with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
+        transactions = conn.execute(
             "SELECT * FROM transactions WHERE user_id = ? "
-            "ORDER BY date DESC",
+            "ORDER BY date DESC LIMIT 20",
             (user_id,)
-        )
-        transactions = cursor.fetchall()
+        ).fetchall()
 
     if not transactions:
-        await query.edit_message_caption(
-            caption="No transactions found!",
-            reply_markup=None
+        await query.edit_message_text(
+            "📭 No transactions found!",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data="back_to_summary")]
+            ])
         )
         return MAIN_MENU
 
-    # Format each transaction with proper styling
-    trans_text = "<b>📜 𝗧𝗿𝗮𝗻𝘀𝗮𝗰𝘁𝗶𝗼𝗻 𝗛𝗶𝘀𝘁𝗼𝗿𝘆</b>\n\n"
+    trans_text = f"<b>💳 Transaction History ({len(transactions)} records)</b>\n\n"
     
     for t in transactions:
-        date = format_transaction_date_long(t['date'])
-        trans_type = "🟢 Income" if t['type'] == 'income' else "🔴 Expense"
-        amount = t['amount']
-        currency = t['currency']
-        wallet_name = get_wallet_name(t['wallet_id']) if t['wallet_id'] else "Unknown"
-        description = t['description']
+        # Convert Row to dict for safer access
+        transaction = dict(t)
         
-        # Format amount with color
-        amount_str = format_money(abs(amount), currency)
-        if amount > 0:
-            amount_display = f"<b>+{amount_str}</b>"
-        else:
-            amount_display = f"<b>–{amount_str}</b>"
+        # Get currency with fallback
+        trans_currency = transaction['currency'] if 'currency' in transaction else currency
         
+        # Formatting elements
+        date = format_transaction_date(transaction['date'])
+        icon = "🟢" if transaction['type'] == 'income' else "🔴" if transaction['type'] == 'outcome' else "🔵"
+        wallet = get_wallet_name(transaction['wallet_id']) if 'wallet_id' in transaction and transaction['wallet_id'] else "External"
+        
+        # Amount formatting with color
+        amount = transaction['amount']
+        amount_str = format_money(abs(amount), trans_currency)
+        amount_display = (
+            f"<b>+{amount_str}</b>" if amount > 0 
+            else f"<b>-{amount_str}</b>"
+        )
+        
+        # Transaction card
         trans_text += (
-            f"<b>{date}</b>\n"
-            f"{trans_type} • {wallet_name}\n"
-            f"💸 Amount: {amount_display}\n"
-            f"📝 {description}\n\n"
+            f"{icon} <b>{date}</b>\n"
+            f"┣ {amount_display: <15} ┫ {wallet}\n"
+            f"┗ {'📝 ' + transaction['description'][:30] + ('...' if len(transaction['description']) > 30 else '')}\n\n"
         )
     
-    # Add pagination controls
+    # Pagination controls
     keyboard = [
-        [InlineKeyboardButton("🔙 Back to Summary", callback_data="back_to_summary")],
-        #[InlineKeyboardButton("🗑 Delete Transaction", callback_data="delete_transactions")]
+        [InlineKeyboardButton("🔄 Refresh", callback_data="show_recent_trans"),
+         InlineKeyboardButton("🗑 Delete", callback_data="delete_trans_menu")],
+        [InlineKeyboardButton("🔙 Summary", callback_data="back_to_summary")]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Edit the caption of the existing photo message
-    await query.edit_message_caption(
-        caption=trans_text,
-        parse_mode='HTML',
-        reply_markup=reply_markup
-    )
+    try:
+        await query.edit_message_text(
+            text=trans_text,
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard))
+    except Exception as e:
+        logger.error(f"Error showing transactions: {str(e)}")
+        # Fallback to new message
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=trans_text,
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard))
     
     return MAIN_MENU
 
 async def back_to_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle 'Back to Summary' action with robust message management"""
     query = update.callback_query
-    await query.answer()
-    
-    # Delete the previous message
     try:
-        await query.message.delete()
+        await query.answer()  # Always answer callback first
+        
+        # Step 1: Try to edit existing message
+        try:
+            return await show_balance(update, context)
+        except Exception as edit_error:
+            logger.debug(f"Message edit failed, trying deletion: {edit_error}")
+            
+            # Step 2: If edit fails, try deleting
+            try:
+                await query.message.delete()
+            except Exception as delete_error:
+                logger.debug(f"Message deletion failed: {delete_error}")
+                
+                # Step 3: If deletion fails, send new message
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text="Loading summary...",
+                    reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
+                )
+            
+            # Final attempt to show balance
+            return await show_balance(update, context)
+            
     except Exception as e:
-        logger.error(f"Error deleting message: {e}")
-    
-    # Show the balance summary
-    return await show_balance(update, context)
+        logger.error(f"Critical error in back_to_summary: {str(e)}")
+        # Ultimate fallback
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Returning to main menu...",
+            reply_markup=ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
+        )
+        return MAIN_MENU
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Log errors caused by updates."""
@@ -2549,45 +2861,40 @@ def main() -> None:
     # Initialize database
     init_db()
 
-    # Create application with job queue
     try:
         TOKEN = os.getenv("TELEGRAM_TOKEN", "8017763140:AAExoD8l4LSkVqVMu-m0ndN_mpmK1-lXQ-s")
         application = Application.builder().token(TOKEN).build()
-    except Exception as e:
-        logger.error(f"Failed to create application: {e}")
-        return
+        
+        # Add error handler
+        application.add_error_handler(error_handler)
 
-    application.add_error_handler(error_handler)
-
-    job_queue = application.job_queue
-    if job_queue:
-        try:
+        # Configure job queue
+        job_queue = application.job_queue
+        if job_queue:
             job_queue.run_repeating(
                 process_recurring_transactions,
-                interval=datetime.timedelta(days=1),
-                first=datetime.time(hour=0, minute=0, tzinfo=TIMEZONE)
+                interval=timedelta(days=1),
+                first=time(hour=0, minute=0, tzinfo=TIMEZONE)
             )
             job_queue.run_repeating(
                 notify_budget_updates,
-                interval=datetime.timedelta(days=7),
-                first=datetime.time(hour=9, minute=0, tzinfo=TIMEZONE)
+                interval=timedelta(days=7),
+                first=time(hour=9, minute=0, tzinfo=TIMEZONE)
             )
-        except Exception as e:
-            logger.error(f"Failed to schedule jobs: {str(e)}")
 
-    # Conversation handler
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('start', start)],
-        states={
-            MAIN_MENU: [
-            MessageHandler(filters.Regex(r'^💰 Balance$'), show_balance_menu),
-            MessageHandler(filters.Regex(r'^📥 Income$'), income_menu),
-            MessageHandler(filters.Regex(r'^📤 Outcome$'), outcome_menu),
-            MessageHandler(filters.Regex(r'^⏳ Hold$'), holds_menu),
-            MessageHandler(filters.Regex(r'^⚙️ Settings$'), settings_menu),
-            CallbackQueryHandler(show_recent_transactions, pattern=r"^show_recent_trans$"),
-            CallbackQueryHandler(back_to_summary, pattern=r"^back_to_summary$"),
-        ],
+        # Add conversation handler with corrected regex
+        conv_handler = ConversationHandler(
+            entry_points=[CommandHandler('start', start)],
+            states={
+                MAIN_MENU: [
+                    MessageHandler(filters.Regex(r'^\💰 Balance$'), show_balance),
+                    MessageHandler(filters.Regex(r'^\📥 Income$'), income_menu),
+                    MessageHandler(filters.Regex(r'^\📤 Outcome$'), outcome_menu),
+                    MessageHandler(filters.Regex(r'^\⏳ Hold$'), holds_menu),
+                    MessageHandler(filters.Regex(r'^\⚙️ Settings$'), settings_menu),
+                    MessageHandler(filters.Regex(r'^(\+|\-|\!).*'), handle_quick_entries),
+                    CallbackQueryHandler(show_balance, pattern=r"^back_to_balance$"),
+                ],
         CHOOSE_WALLET_INCOME: [
             CallbackQueryHandler(wallet_chosen_income, pattern=r"^income_wallet_"),
             CallbackQueryHandler(start_over, pattern=r"^back_income"),
@@ -2706,18 +3013,36 @@ def main() -> None:
     MessageHandler(filters.Regex(r'^🔙 Back$'), start_over)
 ],
         },
-        fallbacks=[CommandHandler('start', start)],
-        allow_reentry=True
-    )
+            fallbacks=[CommandHandler('start', start)],
+            allow_reentry=True
+        )
 
-    application.add_handler(conv_handler)
-    application.add_handler(CommandHandler("updatecode1", update_code1))
+        application.add_handler(CallbackQueryHandler(
+        refresh_transactions, 
+        pattern="^refresh_transactions$"
+        ))
+        application.add_handler(CallbackQueryHandler(
+        back_to_transactions, 
+        pattern="^back_transactions$"
+        ))
 
-    # Start the Bot
-    try:
-        application.run_polling()
+        application.add_handler(conv_handler)
+        
+        # Add other handlers
+        application.add_handler(CommandHandler("updatecode1", update_code1))
+        
+        application.add_handler(CallbackQueryHandler(back_to_transactions, pattern="^back_transactions$"))
+        # Start polling
+        print("🤖 Bot starting in polling mode...")
+        application.run_polling(
+            poll_interval=3.0,
+            timeout=30,
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
+        )
+
     except Exception as e:
-        logger.error(f"Bot failed to start: {e}")
+        logger.error(f"Failed to create application: {e}")
 
 if __name__ == '__main__':
     main()
