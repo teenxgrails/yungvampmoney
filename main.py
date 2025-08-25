@@ -2897,7 +2897,7 @@ def main() -> None:
     init_db()
 
     try:
-        TOKEN = os.getenv("TELEGRAM_TOKEN", "8017763140:AAExoD8l4LSkVqVMu-m0ndN_mpmK1-lXQ-s")
+        TOKEN = os.getenv("TELEGRAM_TOKEN", "7847351145:AAEgUwSdwpYoLANB06PumVfTeQEH-I85EbM")
         application = Application.builder().token(TOKEN).build()
         
         # Add error handler
